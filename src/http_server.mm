@@ -1117,17 +1117,42 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             return parser.feed(engine.tokenizer, tok_id, emit_piece, emit_tool_call);
         };
 
+        int64_t last_prog_ts = static_cast<int64_t>(std::time(nullptr));
+        auto on_prefill = [&](int done_toks, int total_toks) -> bool {
+            // Abort immediately if client disconnected!
+            char peek_b = 0;
+            ssize_t pn = recv(client_fd, &peek_b, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (pn == 0) {
+                fprintf(stderr, "[req #%llu] client disconnected during prefill (%d/%d)\n",
+                        static_cast<unsigned long long>(req_id), done_toks, total_toks);
+                client_ok = false;
+                return false;
+            }
+            int64_t now_s = static_cast<int64_t>(std::time(nullptr));
+            if (now_s - last_prog_ts >= 2) {
+                last_prog_ts = now_s;
+                fprintf(stderr, "[req #%llu] prefill %d/%d tok (%.0f%%)\n",
+                        static_cast<unsigned long long>(req_id), done_toks, total_toks,
+                        100.0 * done_toks / std::max(1, total_toks));
+                if (stream && client_ok) {
+                    client_ok = send_str(client_fd, ": prefilling\n\n");
+                    if (!client_ok) return false;
+                }
+            }
+            return true;
+        };
+
         GenStats stats;
         std::vector<int32_t> out_ids;
         if (client_ok) {
             if (run_spec) {
                 out_ids = engine.generate_speculative(seq, prompt_ids, clamped_max_tokens,
                                                       cfg.draft_depth, stats, false, on_token,
-                                                      true, sys_prefix_len);
+                                                      true, sys_prefix_len, on_prefill);
             } else {
                 out_ids = engine.generate_plain(seq, prompt_ids, clamped_max_tokens,
                                                 stats, false, sampling, on_token,
-                                                true, sys_prefix_len);
+                                                true, sys_prefix_len, on_prefill);
             }
         }
 

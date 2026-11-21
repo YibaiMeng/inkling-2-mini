@@ -160,6 +160,7 @@ bool InklingEngine::init(const std::string& manifest_path,
     pso_attn_rel_table_     = make_pso(device, library, "attn_rel_table");
     pso_rel_attn_split_     = make_pso(device, library, "rel_attn_split");
     pso_rel_attn_merge_gate_= make_pso(device, library, "rel_attn_merge_gate");
+    pso_rel_attn_prefill_amx_ = make_pso(device, library, "rel_attn_prefill_amx");
     pso_add_bf16_f32_       = make_pso(device, library, "add_bf16_to_f32");
     pso_add_f32_bf16_bf16_  = make_pso(device, library, "add_f32_bf16_to_bf16");
     pso_add_bf16_bf16_bf16_ = make_pso(device, library, "add_bf16_bf16_to_bf16");
@@ -171,6 +172,10 @@ bool InklingEngine::init(const std::string& manifest_path,
     pso_moe_w2_nvfp4_       = make_pso(device, lib_safe, "moe_w2_nvfp4_coalesced");
     pso_moe_w13_mxfp8_      = make_pso(device, lib_safe, "moe_w13_mxfp8_coalesced");
     pso_moe_w2_mxfp8_       = make_pso(device, lib_safe, "moe_w2_mxfp8_coalesced");
+    pso_moe_w13_nvfp4_prefill_ = make_pso(device, library, "moe_w13_nvfp4_prefill");
+    pso_moe_w2_nvfp4_prefill_  = make_pso(device, library, "moe_w2_nvfp4_prefill");
+    pso_moe_w13_mxfp8_prefill_ = make_pso(device, library, "moe_w13_mxfp8_prefill");
+    pso_moe_w2_mxfp8_prefill_  = make_pso(device, library, "moe_w2_mxfp8_prefill");
     pso_moe_reduce_         = make_pso(device, library, "moe_reduce_sum");
     pso_moe_reduce_conv_add_= make_pso(device, library, "moe_reduce_conv_add");
     pso_argmax_             = make_pso(device, library, "argmax_f32");
@@ -234,14 +239,14 @@ bool InklingEngine::init(const std::string& manifest_path,
     buf_q_f32_       = alloc(MAX_M * 24 * 128 * 4);
     buf_r_bf16_      = alloc(MAX_M * 24 * 16 * 2);
     buf_rel_table_   = alloc(MAX_M * 24 * 1024 * 2);
-    buf_attn_part_out_ = alloc(MAX_M * 24 * 32 * 128 * 4);
-    buf_attn_part_st_  = alloc(MAX_M * 24 * 32 * 8);
+    buf_attn_part_out_ = alloc(8 * 24 * 16 * 128 * 4);
+    buf_attn_part_st_  = alloc(8 * 24 * 16 * 8);
     buf_attn_out_    = alloc(MAX_M * 3072 * 2);
     buf_wo_out_      = alloc(MAX_M * D * 2);
     buf_sconv_out_   = alloc(MAX_M * D * 2);
 
     buf_router_logits_ = alloc(MAX_M * 128 * 4);
-    buf_route_table_ = alloc(65536);
+    buf_route_table_ = alloc(1048576);
     buf_ind_w13_     = alloc(64);
     buf_ind_w2_      = alloc(64);
     buf_act_q_       = alloc(MAX_M * D * 4);
@@ -553,7 +558,7 @@ void InklingEngine::encode_linear(id<MTLComputeCommandEncoder> enc,
                                   id<MTLBuffer> y, size_t y_off, bool out_f32,
                                   uint32_t M, uint32_t N, uint32_t K, float softcap) {
     LinearParams p{M, N, K, out_f32 ? 1u : 0u, has_bias ? 1u : 0u, x_is_f32 ? 1u : 0u, softcap};
-    if (K == 64 && x_is_f32 && out_f32 && !has_bias && M <= 32) {
+    if (K == 64 && x_is_f32 && out_f32 && !has_bias && M <= 512) {
         [enc setComputePipelineState:pso_linear_k64_];
         [enc setBuffer:x offset:x_off atIndex:0];
         [enc setBuffer:w.buf offset:w.offset atIndex:1];
@@ -686,9 +691,12 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
                   buf_router_logits_, 0, true, M, 128, 2304);
 
     // 1b. Fast Top-8 + unique expert bucketing
-    // NVFP4: w13 grid_x=288 (1 pair/SG), w2 grid_x=144 (4 rows/SG!)
-    // MXFP8: w13 grid_x=288 (1 pair/SG), w2 grid_x=288 (2 rows/SG)
-    RouterParams rp{M, 288u, lw.w2.is_nvfp4 ? 144u : 288u, weights.cfg.route_scale};
+    // Prefill (M > 8): AMX simdgroup_bfloat8x8 kernels -> grid_x = 36 (64 rows/TG)
+    // Decode/Verify (M <= 8): zero-barrier GEMV kernels -> NVFP4 (288, 144), MXFP8 (288, 288)
+    const bool use_amx_prefill = (M > 8u);
+    uint32_t w13_gx = use_amx_prefill ? 36u : 288u;
+    uint32_t w2_gx  = use_amx_prefill ? 36u : (lw.w2.is_nvfp4 ? 144u : 288u);
+    RouterParams rp{M, w13_gx, w2_gx, weights.cfg.route_scale};
     [enc setComputePipelineState:pso_moe_topk_];
     [enc setBuffer:buf_router_logits_ offset:0 atIndex:0];
     [enc setBuffer:lw.router_bias.buf offset:lw.router_bias.offset atIndex:1];
@@ -708,9 +716,11 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&W1 length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(160, 1, 1)];
 
-        // 2b. Coalesced W13 NVFP4 + Fused Weighted SwiGLU (dedicated M=1 kernel when M==1!)
+        // 2b. Coalesced W13 NVFP4 + Fused Weighted SwiGLU
         MoEQuantParams qp1{2304u, 2304u, lw.w13.outer_denom, weights.cfg.gate_cap, weights.cfg.up_cap};
-        [enc setComputePipelineState:(M == 1u ? pso_moe_w13_nvfp4_m1_ : pso_moe_w13_nvfp4_)];
+        id<MTLComputePipelineState> w13_pso = use_amx_prefill ? pso_moe_w13_nvfp4_prefill_
+                                                              : (M == 1u ? pso_moe_w13_nvfp4_m1_ : pso_moe_w13_nvfp4_);
+        [enc setComputePipelineState:w13_pso];
         [enc setBuffer:buf_act_q_ offset:0 atIndex:0];
         [enc setBuffer:buf_act_amax_ offset:0 atIndex:1];
         [enc setBuffer:lw.w13.weight.buf offset:lw.w13.weight.offset atIndex:2];
@@ -734,7 +744,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
 
         // 3b. Coalesced W2 NVFP4
         MoEQuantParams qp2{1152u, 2304u, lw.w2.outer_denom, 0.0f, 0.0f};
-        [enc setComputePipelineState:pso_moe_w2_nvfp4_];
+        [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w2_nvfp4_prefill_ : pso_moe_w2_nvfp4_)];
         [enc setBuffer:buf_mid_q_ offset:0 atIndex:0];
         [enc setBuffer:buf_mid_amax_ offset:0 atIndex:1];
         [enc setBuffer:lw.w2.weight.buf offset:lw.w2.weight.offset atIndex:2];
@@ -756,7 +766,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc dispatchThreadgroups:MTLSizeMake(W1 / 32u, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
         MoEQuantParams qp1{2304u, 2304u, 1.0f, weights.cfg.gate_cap, weights.cfg.up_cap};
-        [enc setComputePipelineState:pso_moe_w13_mxfp8_];
+        [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w13_mxfp8_prefill_ : pso_moe_w13_mxfp8_)];
         [enc setBuffer:buf_act_q_ offset:0 atIndex:0];
         [enc setBuffer:lw.w13.weight.buf offset:lw.w13.weight.offset atIndex:1];
         [enc setBuffer:lw.w13.scales.buf offset:lw.w13.scales.offset atIndex:2];
@@ -774,7 +784,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&W2 length:4 atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(W2 / 32u, M * 8u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-        [enc setComputePipelineState:pso_moe_w2_mxfp8_];
+        [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w2_mxfp8_prefill_ : pso_moe_w2_mxfp8_)];
         [enc setBuffer:buf_mid_q_ offset:0 atIndex:0];
         [enc setBuffer:lw.w2.weight.buf offset:lw.w2.weight.offset atIndex:1];
         [enc setBuffer:lw.w2.scales.buf offset:lw.w2.scales.offset atIndex:2];
@@ -1106,8 +1116,9 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
             [enc setBuffer:buf_rel_table_ offset:0 atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(32, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            // ----- Relative-Position Split-KV FlashDecoding + Fused Output Gate -----
-            // Fixed parts=16 ensures identical FP reduction tree across M=1 and M>1 (speculative verify)!
+            // ----- Relative-Position Attention + Fused Output Gate -----
+            // Prefill (M > 8): AMX FlashAttention-2 (BM=16, BN=32, 16x less KV bandwidth, zero partial_out!)
+            // Decode/Verify (M <= 8): Fixed parts=16 Split-KV preserves 256/256 bit-exact FP reduction tree!
             uint32_t parts = 16u;
             RelAttnParams rap{
                 M, start_pos, kv_cap, visit.local ? 1u : 0u,
@@ -1115,24 +1126,36 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 parts, q_stride, gate_offset, sink_offset,
                 1.0f / std::sqrt(128.0f)
             };
-            [enc setComputePipelineState:pso_rel_attn_split_];
-            [enc setBuffer:buf_q_f32_ offset:0 atIndex:0];
-            [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:1];
-            [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:2];
-            [enc setBuffer:buf_rel_table_ offset:0 atIndex:3];
-            [enc setBuffer:buf_q_proj_ offset:0 atIndex:4];
-            [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:5];
-            [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:6];
-            [enc setBytes:&rap length:sizeof(rap) atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(parts, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (M > 8u) {
+                [enc setComputePipelineState:pso_rel_attn_prefill_amx_];
+                [enc setBuffer:buf_q_f32_ offset:0 atIndex:0];
+                [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:1];
+                [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:2];
+                [enc setBuffer:buf_rel_table_ offset:0 atIndex:3];
+                [enc setBuffer:buf_q_proj_ offset:0 atIndex:4];
+                [enc setBuffer:buf_attn_out_ offset:0 atIndex:5];
+                [enc setBytes:&rap length:sizeof(rap) atIndex:6];
+                [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, 24, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                [enc setComputePipelineState:pso_rel_attn_split_];
+                [enc setBuffer:buf_q_f32_ offset:0 atIndex:0];
+                [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:1];
+                [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:2];
+                [enc setBuffer:buf_rel_table_ offset:0 atIndex:3];
+                [enc setBuffer:buf_q_proj_ offset:0 atIndex:4];
+                [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:5];
+                [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:6];
+                [enc setBytes:&rap length:sizeof(rap) atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(parts, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            [enc setComputePipelineState:pso_rel_attn_merge_gate_];
-            [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:0];
-            [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:1];
-            [enc setBuffer:buf_q_proj_ offset:0 atIndex:2];
-            [enc setBuffer:buf_attn_out_ offset:0 atIndex:3];
-            [enc setBytes:&rap length:sizeof(rap) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(1, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc setComputePipelineState:pso_rel_attn_merge_gate_];
+                [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:0];
+                [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:1];
+                [enc setBuffer:buf_q_proj_ offset:0 atIndex:2];
+                [enc setBuffer:buf_attn_out_ offset:0 atIndex:3];
+                [enc setBytes:&rap length:sizeof(rap) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(1, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
 
             // ----- Output Projection + Fused Attention ShortConv + Residual Update -----
             encode_linear(enc, buf_attn_out_, 0, false, lw.wo, nil, 0, false, buf_wo_out_, 0, false, M, D, 3072);
@@ -1932,7 +1955,8 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
                                                    const SamplingParams& sampling,
                                                    const TokenCallback& on_token,
                                                    bool reuse_prefix,
-                                                   int sys_prefix_len) {
+                                                   int sys_prefix_len,
+                                                   const PrefillCallback& on_prefill) {
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
     uint64_t rng = sampling.seed ? sampling.seed : 42ULL;
@@ -1964,6 +1988,9 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
             next_tok = (sampling.temperature > 0.0f)
                            ? sample_logits_cpu(reinterpret_cast<const float*>(buf_logits_.contents), sampling, rng)
                            : preds[0];
+        } else if (on_prefill && !on_prefill(static_cast<int>(off), static_cast<int>(prompt_ids.size()))) {
+            stats.prefill_ms = now_ms() - t0;
+            return {};
         }
     }
     if (reuse_prefix) {
@@ -2005,7 +2032,8 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
                                                          bool stream_stdout,
                                                          const TokenCallback& on_token,
                                                          bool reuse_prefix,
-                                                         int sys_prefix_len) {
+                                                         int sys_prefix_len,
+                                                         const PrefillCallback& on_prefill) {
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
     const bool adaptive = (draft_depth <= 0);
@@ -2041,7 +2069,7 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
         return best_d;
     };
 
-    // Prefill with exact prefix cache reuse + tap capture (32-token chunks + unembed ONLY last token!)
+    // Prefill with exact prefix cache reuse + tap capture (128-token AMX chunks + unembed ONLY last token!)
     double t0 = now_ms();
     int cached = reuse_prefix ? prepare_prefix_cache(seq, prompt_ids, true) : (reset_sequence(seq), 0);
     stats.cached_tokens = cached;
@@ -2061,12 +2089,21 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
         auto preds = forward_target_single(seq, chunk, true, false, nullptr,
                                            is_last ? LogitsMode::LastOnly : LogitsMode::None);
         off += len;
+        if (seq.pending_count >= 512) {
+            draft_flush_context(seq);
+        }
         if (reuse_prefix && sys_prefix_len > 0 && static_cast<int>(off) == sys_prefix_len &&
             (!seq.sys_snap.has_draft || seq.sys_snap.pos != sys_prefix_len)) {
             draft_flush_context(seq);
             save_prefix_snapshot(seq, seq.sys_snap, true);
         }
-        if (is_last) cur_tok = preds[0];
+        if (is_last) {
+            cur_tok = preds[0];
+        } else if (on_prefill && !on_prefill(static_cast<int>(off), static_cast<int>(prompt_ids.size()))) {
+            draft_flush_context(seq);
+            stats.prefill_ms = now_ms() - t0;
+            return {};
+        }
     }
     draft_flush_context(seq);
     if (reuse_prefix) {

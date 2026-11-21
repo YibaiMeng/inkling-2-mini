@@ -129,6 +129,8 @@ public:
 
     // Optional per-token streaming callback; return false to stop generation early.
     using TokenCallback = std::function<bool(int32_t)>;
+    // Optional prefill progress callback(done_tokens, total_tokens); return false to abort prefill.
+    using PrefillCallback = std::function<bool(int, int)>;
 
     // High-level generation helpers
     std::vector<int32_t> generate_plain(SequenceState& seq,
@@ -139,7 +141,8 @@ public:
                                         const SamplingParams& sampling = {},
                                         const TokenCallback& on_token = nullptr,
                                         bool reuse_prefix = false,
-                                        int sys_prefix_len = 0);
+                                        int sys_prefix_len = 0,
+                                        const PrefillCallback& on_prefill = nullptr);
 
     // draft_depth == 0 enables online adaptive speculative depth controller; 1..7 fixes depth.
     std::vector<int32_t> generate_speculative(SequenceState& seq,
@@ -150,7 +153,8 @@ public:
                                               bool stream_stdout = false,
                                               const TokenCallback& on_token = nullptr,
                                               bool reuse_prefix = false,
-                                              int sys_prefix_len = 0);
+                                              int sys_prefix_len = 0,
+                                              const PrefillCallback& on_prefill = nullptr);
 
     // Multi-sequence parallel low-batch generation (B = 1..8)
     std::vector<std::vector<int32_t>> generate_batch(const std::vector<std::vector<int32_t>>& prompts,
@@ -178,6 +182,7 @@ private:
     id<MTLComputePipelineState> pso_attn_rel_table_ = nil;
     id<MTLComputePipelineState> pso_rel_attn_split_ = nil;
     id<MTLComputePipelineState> pso_rel_attn_merge_gate_ = nil;
+    id<MTLComputePipelineState> pso_rel_attn_prefill_amx_ = nil;
     id<MTLComputePipelineState> pso_add_bf16_f32_ = nil;
     id<MTLComputePipelineState> pso_add_f32_bf16_bf16_ = nil;
     id<MTLComputePipelineState> pso_add_bf16_bf16_bf16_ = nil;
@@ -189,6 +194,10 @@ private:
     id<MTLComputePipelineState> pso_moe_w2_nvfp4_ = nil;
     id<MTLComputePipelineState> pso_moe_w13_mxfp8_ = nil;
     id<MTLComputePipelineState> pso_moe_w2_mxfp8_ = nil;
+    id<MTLComputePipelineState> pso_moe_w13_nvfp4_prefill_ = nil;
+    id<MTLComputePipelineState> pso_moe_w2_nvfp4_prefill_ = nil;
+    id<MTLComputePipelineState> pso_moe_w13_mxfp8_prefill_ = nil;
+    id<MTLComputePipelineState> pso_moe_w2_mxfp8_prefill_ = nil;
     id<MTLComputePipelineState> pso_moe_reduce_ = nil;
     id<MTLComputePipelineState> pso_moe_reduce_conv_add_ = nil;
     id<MTLComputePipelineState> pso_argmax_ = nil;
@@ -205,8 +214,8 @@ private:
     id<MTLComputePipelineState> pso_draft_folded_logits_ = nil;
     id<MTLComputePipelineState> pso_precompute_folded_ = nil;
 
-    // Reusable scratch GPU buffers (sized for max M=32 prefill, decode/verify M<=8!)
-    static constexpr int MAX_M = 32;
+    // Reusable scratch GPU buffers (sized for max M=512 AMX prefill, decode/verify M<=8!)
+    static constexpr int MAX_M = 512;
     static constexpr int MAX_LOGITS_M = 8;
     id<MTLBuffer> buf_tok_ids_ = nil;
     id<MTLBuffer> buf_argmax_ = nil;
