@@ -131,6 +131,11 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
         cfg.hidden_size = tc.at("hidden_size").as_int();
         cfg.vocab_size = tc.at("vocab_size").as_int();
         cfg.unpadded_vocab = tc.at("unpadded_vocab_size").as_int();
+        if (const auto* ml = tc.get("model_max_length"); ml && ml->is_number()) {
+            cfg.model_max_length = ml->as_int();
+        } else if (const auto* mp = tc.get("max_position_embeddings"); mp && mp->is_number()) {
+            cfg.model_max_length = mp->as_int();
+        }
         cfg.head_dim = tc.at("head_dim").as_int();
         cfg.heads = tc.at("num_attention_heads").as_int();
         cfg.kv_heads = tc.at("num_key_value_heads").as_int();

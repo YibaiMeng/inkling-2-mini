@@ -115,6 +115,7 @@ struct ModelConfig {
     int hidden_size = 2304;
     int vocab_size = 201024;
     int unpadded_vocab = 200058;
+    int model_max_length = 1048576;
     int head_dim = 128;
     int heads = 24;
     int kv_heads = 8;

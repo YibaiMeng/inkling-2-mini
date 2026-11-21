@@ -9,8 +9,9 @@
 
 struct SequenceState {
     int pos = 0;
-    int max_global_seq = 0;
-    int local_kv_cap = 1088; // 1024 + 64 headroom for speculative rollback
+    int max_global_seq = 0;     // Currently allocated global KV capacity (grows dynamically)
+    int max_seq_limit = 262144; // Hard maximum context length (default 256K)
+    int local_kv_cap = 1088;    // 1024 + 64 headroom for speculative rollback
 
     // Per-visit (48) caches:
     // Local visits: K/V [8, 1088, 128] BF16
@@ -72,9 +73,10 @@ public:
               const std::string& blobs_dir,
               const std::string& metal_path,
               bool load_draft = true,
-              int max_seq = 4096);
+              int max_seq = 262144);
 
-    SequenceState create_sequence(int max_global_seq = 4096);
+    SequenceState create_sequence(int max_global_seq = 262144);
+    bool ensure_global_capacity(SequenceState& seq, int needed_tokens);
     void reset_sequence(SequenceState& seq);
 
     // Run target model forward on M tokens (1 <= M <= 32) for ONE sequence starting at seq.pos.

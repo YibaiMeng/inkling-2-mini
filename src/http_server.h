@@ -9,7 +9,7 @@ struct ServerConfig {
     int draft_depth = 0; // 0 = adaptive
     std::string default_think = "0";
     std::string model_name = "inkling-2-mini";
-    int max_seq = 4096;
+    int max_seq = 262144;
 };
 
 int run_openai_server(InklingEngine& engine, const ServerConfig& cfg);

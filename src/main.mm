@@ -18,6 +18,7 @@ static void print_usage(const char* prog) {
            "  --raw-prompt <text>   Raw prompt string (no chat template)\n"
            "  --think <effort>      Thinking effort (0, 0.1, 0.2, 0.7, 0.9, 0.99; default: 0)\n"
            "  --max-tokens <N>      Max generated tokens (default: 128)\n"
+           "  --max-seq <N>         Max context length (default: 262144; KV grows on demand)\n"
            "  --batch <B>           Concurrent batch size 1..8 (default: 1)\n"
            "  --spec                Enable DSpark speculative decoding (B=1, greedy)\n"
            "  --no-spec             Disable speculative decoding (e.g., with --serve)\n"
@@ -43,6 +44,7 @@ int main(int argc, char** argv) {
     std::string think = "0";
     bool raw_prompt = false;
     int max_tokens = 128;
+    int max_seq = 262144;
     int batch_size = 1;
     bool use_spec = false;
     bool spec_explicit = false;
@@ -63,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--raw-prompt" && i + 1 < argc) { prompt = argv[++i]; raw_prompt = true; }
         else if (a == "--think" && i + 1 < argc) { think = argv[++i]; }
         else if (a == "--max-tokens" && i + 1 < argc) { max_tokens = atoi(argv[++i]); }
+        else if (a == "--max-seq" && i + 1 < argc) { max_seq = std::max(1024, atoi(argv[++i])); }
         else if (a == "--batch" && i + 1 < argc) { batch_size = atoi(argv[++i]); }
         else if (a == "--spec") { use_spec = true; spec_explicit = true; }
         else if (a == "--no-spec") { use_spec = false; spec_explicit = true; }
@@ -88,7 +91,7 @@ int main(int argc, char** argv) {
     }
 
     InklingEngine engine;
-    if (!engine.init(manifest, blobs, metal_path, use_spec, 4096)) {
+    if (!engine.init(manifest, blobs, metal_path, use_spec, max_seq)) {
         fprintf(stderr, "Engine initialization failed.\n");
         return 1;
     }
@@ -97,7 +100,7 @@ int main(int argc, char** argv) {
         srv_cfg.use_spec = use_spec;
         srv_cfg.draft_depth = draft_depth;
         srv_cfg.default_think = think;
-        srv_cfg.max_seq = 4096;
+        srv_cfg.max_seq = max_seq;
         return run_openai_server(engine, srv_cfg);
     }
 
@@ -121,7 +124,7 @@ int main(int argc, char** argv) {
                 stats.prompt_tokens / (stats.prefill_ms / 1000.0),
                 stats.gen_tokens - batch_size, stats.decode_ms, dec_tps, dec_tps / batch_size);
     } else {
-        auto seq = engine.create_sequence(4096);
+        auto seq = engine.create_sequence(max_seq);
         std::vector<int32_t> out;
         if (use_spec) {
             out = engine.generate_speculative(seq, prompt_ids, max_tokens, draft_depth, stats, stream);

@@ -305,7 +305,9 @@ void InklingEngine::precompute_draft_folded() {
 SequenceState InklingEngine::create_sequence(int max_global_seq) {
     SequenceState s;
     s.pos = 0;
-    s.max_global_seq = max_global_seq;
+    s.max_seq_limit = std::max(max_global_seq, 1024);
+    // Start at <= 4096 tokens (~144 MB global KV) and dynamically grow up to max_seq_limit (256K = 9.0 GB) on demand!
+    s.max_global_seq = std::min(s.max_seq_limit, 4096);
     s.local_kv_cap = 1088;
     const size_t nvisits = weights.plan.size(); // 48
     s.k_cache.resize(nvisits);
@@ -326,7 +328,8 @@ SequenceState InklingEngine::create_sequence(int max_global_seq) {
     };
 
     for (size_t i = 0; i < nvisits; ++i) {
-        size_t cap = weights.plan[i].local ? s.local_kv_cap : max_global_seq;
+        size_t cap = weights.plan[i].local ? static_cast<size_t>(s.local_kv_cap)
+                                           : static_cast<size_t>(s.max_global_seq);
         size_t kv_bytes = 8 * cap * 128 * 2; // [8, cap, 128] BF16
         s.k_cache[i] = alloc_zero(kv_bytes);
         s.v_cache[i] = alloc_zero(kv_bytes);
@@ -344,7 +347,8 @@ SequenceState InklingEngine::create_sequence(int max_global_seq) {
         s.draft_k_cache.resize(weights.draft.num_layers);
         s.draft_v_cache.resize(weights.draft.num_layers);
         for (int i = 0; i < weights.draft.num_layers; ++i) {
-            size_t cap = weights.draft.layers[i].is_local ? s.local_kv_cap : max_global_seq;
+            size_t cap = weights.draft.layers[i].is_local ? static_cast<size_t>(s.local_kv_cap)
+                                                          : static_cast<size_t>(s.max_global_seq);
             size_t kv_bytes = 8 * cap * 128 * 2;
             s.draft_k_cache[i] = alloc_zero(kv_bytes);
             s.draft_v_cache[i] = alloc_zero(kv_bytes);
@@ -353,6 +357,52 @@ SequenceState InklingEngine::create_sequence(int max_global_seq) {
         s.draft_rnn_state = alloc_zero(256 * 2);
     }
     return s;
+}
+
+bool InklingEngine::ensure_global_capacity(SequenceState& s, int needed_tokens) {
+    if (needed_tokens <= s.max_global_seq) return true;
+    if (needed_tokens > s.max_seq_limit) return false;
+
+    int old_cap = s.max_global_seq;
+    int new_cap = std::max(old_cap, 4096);
+    while (new_cap < needed_tokens && new_cap < s.max_seq_limit) {
+        new_cap = std::min(s.max_seq_limit, new_cap * 2);
+    }
+    if (new_cap < needed_tokens) new_cap = needed_tokens;
+
+    auto grow_kv = [&](__strong id<MTLBuffer>& buf, int used_rows) {
+        size_t new_bytes = size_t(8) * static_cast<size_t>(new_cap) * 128u * 2u;
+        id<MTLBuffer> nb = [device newBufferWithLength:new_bytes options:MTLResourceStorageModeShared];
+        int copy_rows = std::min(old_cap, std::max(0, used_rows));
+        if (copy_rows > 0) {
+            const uint8_t* src = reinterpret_cast<const uint8_t*>(buf.contents);
+            uint8_t* dst = reinterpret_cast<uint8_t*>(nb.contents);
+            size_t old_stride = static_cast<size_t>(old_cap) * 128u * 2u;
+            size_t new_stride = static_cast<size_t>(new_cap) * 128u * 2u;
+            size_t row_bytes = static_cast<size_t>(copy_rows) * 128u * 2u;
+            for (size_t h = 0; h < 8; ++h) {
+                std::memcpy(dst + h * new_stride, src + h * old_stride, row_bytes);
+            }
+        }
+        buf = nb;
+    };
+
+    for (size_t i = 0; i < weights.plan.size(); ++i) {
+        if (!weights.plan[i].local) {
+            grow_kv(s.k_cache[i], s.pos);
+            grow_kv(s.v_cache[i], s.pos);
+        }
+    }
+    if (weights.draft.loaded) {
+        for (int i = 0; i < weights.draft.num_layers; ++i) {
+            if (!weights.draft.layers[i].is_local) {
+                grow_kv(s.draft_k_cache[i], s.draft_ctx_pos);
+                grow_kv(s.draft_v_cache[i], s.draft_ctx_pos);
+            }
+        }
+    }
+    s.max_global_seq = new_cap;
+    return true;
 }
 
 void InklingEngine::reset_sequence(SequenceState& s) {
@@ -692,6 +742,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
     const uint32_t D = weights.cfg.hidden_size; // 2304
     const float eps = weights.cfg.norm_eps;
     const uint32_t start_pos = static_cast<uint32_t>(seq.pos);
+    ensure_global_capacity(seq, seq.pos + static_cast<int>(M));
 
     std::memcpy(buf_tok_ids_.contents, tokens.data(), M * sizeof(int32_t));
 
@@ -1105,6 +1156,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
     }
     const uint32_t D = weights.cfg.hidden_size;
     const float eps = weights.cfg.norm_eps;
+    for (auto* s : seqs) ensure_global_capacity(*s, s->pos + 1);
     std::memcpy(buf_tok_ids_.contents, tokens.data(), B * sizeof(int32_t));
 
     @autoreleasepool {
@@ -1390,6 +1442,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
 // ============================================================================
 void InklingEngine::draft_flush_context(SequenceState& seq) {
     if (!weights.draft.loaded || seq.pending_count == 0) return;
+    ensure_global_capacity(seq, seq.draft_ctx_pos + seq.pending_count + 16);
     const uint32_t D = weights.cfg.hidden_size;
     const float eps = weights.cfg.norm_eps;
     int offset = 0;
@@ -1469,6 +1522,7 @@ void InklingEngine::draft_flush_context(SequenceState& seq) {
 }
 
 std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t anchor_token, int draft_len) {
+    ensure_global_capacity(seq, seq.draft_ctx_pos + seq.pending_count + 16);
     if (seq.pending_count > 64) {
         draft_flush_context(seq);
     }
@@ -1952,7 +2006,7 @@ std::vector<std::vector<int32_t>> InklingEngine::generate_batch(const std::vecto
     const size_t B = prompts.size();
     std::vector<SequenceState> seqs;
     seqs.reserve(B);
-    for (size_t b = 0; b < B; ++b) seqs.push_back(create_sequence(4096));
+    for (size_t b = 0; b < B; ++b) seqs.push_back(create_sequence(262144));
     uint64_t rng = sampling.seed ? sampling.seed : 42ULL;
 
     stats = {};

@@ -104,7 +104,7 @@ std::string to_lower_ascii(std::string s) {
 
 bool read_http_request(int fd, HttpRequest& req) {
     constexpr size_t kMaxHeaderBytes = 64 * 1024;
-    constexpr size_t kMaxBodyBytes = 8 * 1024 * 1024;
+    constexpr size_t kMaxBodyBytes = 64 * 1024 * 1024;
     std::string buf;
     buf.reserve(4096);
     char tmp[4096];
@@ -439,9 +439,9 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
     fprintf(stderr,
             "[server] OpenAI-compatible API listening on http://%s:%d\n"
-            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | GET /health\n"
-            "[server] Model: %s | Speculative: %s (draft_depth=%s) | Default think: %s\n",
-            cfg.host.c_str(), cfg.port, cfg.model_name.c_str(),
+            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | POST /v1/responses | GET /health\n"
+            "[server] Model: %s | Max context: %d | Speculative: %s (draft_depth=%s) | Default think: %s\n",
+            cfg.host.c_str(), cfg.port, cfg.model_name.c_str(), cfg.max_seq,
             cfg.use_spec ? "on" : "off",
             cfg.draft_depth <= 0 ? "auto" : std::to_string(cfg.draft_depth).c_str(),
             cfg.default_think.c_str());
@@ -478,8 +478,18 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
         if (req.method == "GET" && req.path == "/health") {
             std::string body = "{\"status\":\"ok\",\"model\":\"" + json_escape(cfg.model_name) +
-                               "\",\"speculative\":" + (cfg.use_spec ? "true" : "false") + "}";
+                               "\",\"context_length\":" + std::to_string(cfg.max_seq) +
+                               ",\"speculative\":" + (cfg.use_spec ? "true" : "false") + "}";
             send_http_json(client_fd, 200, "OK", body);
+            close(client_fd);
+            continue;
+        }
+
+        if (req.method == "GET" && req.path == "/props") {
+            std::ostringstream oss;
+            oss << "{\"default_generation_settings\":{\"n_ctx\":" << cfg.max_seq
+                << "},\"total_slots\":1,\"model_path\":\"" << json_escape(cfg.model_name) << "\"}";
+            send_http_json(client_fd, 200, "OK", oss.str());
             close(client_fd);
             continue;
         }
@@ -489,13 +499,20 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             std::ostringstream oss;
             oss << "{\"object\":\"list\",\"data\":[{\"id\":\"" << json_escape(cfg.model_name)
                 << "\",\"object\":\"model\",\"created\":" << now_ts
-                << ",\"owned_by\":\"inkling-2-mini-metal\"}]}";
+                << ",\"owned_by\":\"inkling-2-mini-metal\""
+                << ",\"max_model_len\":" << cfg.max_seq
+                << ",\"context_length\":" << cfg.max_seq
+                << ",\"max_context_length\":" << cfg.max_seq
+                << ",\"max_input_tokens\":" << cfg.max_seq
+                << ",\"meta\":{\"n_ctx_train\":" << engine.weights.cfg.model_max_length << "}}]}";
             send_http_json(client_fd, 200, "OK", oss.str());
             close(client_fd);
             continue;
         }
 
-        if (req.path != "/v1/chat/completions" && req.path != "/chat/completions") {
+        bool is_chat = (req.path == "/v1/chat/completions" || req.path == "/chat/completions");
+        bool is_responses = (req.path == "/v1/responses" || req.path == "/responses");
+        if (!is_chat && !is_responses) {
             send_openai_error(client_fd, 404, "Not Found", "Unknown endpoint: " + req.path, "not_found_error");
             close(client_fd);
             continue;
@@ -506,7 +523,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             continue;
         }
 
-        // Parse OpenAI Chat Completions JSON body
+        // Parse JSON body (supports both /v1/chat/completions and /v1/responses)
         json_lite::Value root;
         try {
             root = json_lite::parse(req.body);
@@ -522,24 +539,83 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             continue;
         }
 
-        const auto* msgs_val = root.get("messages");
-        if (!msgs_val || !msgs_val->is_array() || msgs_val->as_array().empty()) {
-            send_openai_error(client_fd, 400, "Bad Request", "Missing or empty 'messages' array");
-            close(client_fd);
-            continue;
-        }
-
         std::vector<ChatMessage> messages;
-        messages.reserve(msgs_val->as_array().size());
-        for (const auto& m : msgs_val->as_array()) {
-            if (!m.is_object()) continue;
-            ChatMessage cm;
-            const auto* rv = m.get("role");
-            cm.role = (rv && rv->is_string()) ? rv->as_string() : "user";
-            cm.content = extract_content_string(m.get("content"));
-            const auto* rcv = m.get("reasoning_content");
-            if (rcv && rcv->is_string()) cm.reasoning_content = rcv->as_string();
-            messages.push_back(std::move(cm));
+        if (is_responses) {
+            if (const auto* inst = root.get("instructions"); inst && inst->is_string() && !inst->as_string().empty()) {
+                messages.push_back({"system", inst->as_string(), ""});
+            }
+            const auto* inp = root.get("input");
+            if (!inp) inp = root.get("messages");
+            if (!inp || inp->is_null()) {
+                send_openai_error(client_fd, 400, "Bad Request", "Missing 'input' field");
+                close(client_fd);
+                continue;
+            }
+            if (inp->is_string()) {
+                messages.push_back({"user", inp->as_string(), ""});
+            } else if (inp->is_array()) {
+                for (const auto& item : inp->as_array()) {
+                    if (item.is_string()) {
+                        messages.push_back({"user", item.as_string(), ""});
+                        continue;
+                    }
+                    if (!item.is_object()) continue;
+                    std::string itype;
+                    if (const auto* type_val = item.get("type"); type_val && type_val->is_string()) {
+                        itype = type_val->as_string();
+                    }
+                    if (itype == "reasoning") {
+                        continue;
+                    }
+                    if (itype == "function_call_output") {
+                        std::string out_txt = extract_content_string(item.get("output"));
+                        messages.push_back({"tool", out_txt, ""});
+                        continue;
+                    }
+                    if (itype == "function_call") {
+                        std::string fn_name, fn_args;
+                        if (const auto* nv = item.get("name"); nv && nv->is_string()) fn_name = nv->as_string();
+                        if (const auto* av = item.get("arguments"); av && av->is_string()) fn_args = av->as_string();
+                        messages.push_back({"assistant", fn_name + "(" + fn_args + ")", ""});
+                        continue;
+                    }
+                    ChatMessage cm;
+                    const auto* rv = item.get("role");
+                    cm.role = (rv && rv->is_string()) ? rv->as_string() : "user";
+                    cm.content = extract_content_string(item.get("content"));
+                    if (cm.content.empty()) {
+                        cm.content = extract_content_string(item.get("text"));
+                    }
+                    messages.push_back(std::move(cm));
+                }
+            } else {
+                send_openai_error(client_fd, 400, "Bad Request", "'input' must be a string or array");
+                close(client_fd);
+                continue;
+            }
+            if (messages.empty()) {
+                send_openai_error(client_fd, 400, "Bad Request", "Empty 'input' messages");
+                close(client_fd);
+                continue;
+            }
+        } else {
+            const auto* msgs_val = root.get("messages");
+            if (!msgs_val || !msgs_val->is_array() || msgs_val->as_array().empty()) {
+                send_openai_error(client_fd, 400, "Bad Request", "Missing or empty 'messages' array");
+                close(client_fd);
+                continue;
+            }
+            messages.reserve(msgs_val->as_array().size());
+            for (const auto& m : msgs_val->as_array()) {
+                if (!m.is_object()) continue;
+                ChatMessage cm;
+                const auto* rv = m.get("role");
+                cm.role = (rv && rv->is_string()) ? rv->as_string() : "user";
+                cm.content = extract_content_string(m.get("content"));
+                const auto* rcv = m.get("reasoning_content");
+                if (rcv && rcv->is_string()) cm.reasoning_content = rcv->as_string();
+                messages.push_back(std::move(cm));
+            }
         }
 
         std::string req_model = cfg.model_name;
@@ -547,8 +623,10 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             req_model = mv->as_string();
         }
 
-        int max_tokens = 512;
-        if (const auto* mt = root.get("max_completion_tokens"); mt && mt->is_number()) {
+        int max_tokens = is_responses ? 1024 : 512;
+        if (const auto* mt0 = root.get("max_output_tokens"); mt0 && mt0->is_number()) {
+            max_tokens = std::max(1, mt0->as_int());
+        } else if (const auto* mt = root.get("max_completion_tokens"); mt && mt->is_number()) {
             max_tokens = std::max(1, mt->as_int());
         } else if (const auto* mt2 = root.get("max_tokens"); mt2 && mt2->is_number()) {
             max_tokens = std::max(1, mt2->as_int());
@@ -594,7 +672,11 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         }
 
         std::string think_effort = cfg.default_think;
-        if (const auto* rv = root.get("reasoning_effort")) {
+        if (const auto* robj = root.get("reasoning"); robj && robj->is_object()) {
+            if (const auto* eff = robj->get("effort")) {
+                think_effort = map_think_effort(eff, think_effort);
+            }
+        } else if (const auto* rv = root.get("reasoning_effort")) {
             think_effort = map_think_effort(rv, think_effort);
         } else if (const auto* thv = root.get("think")) {
             think_effort = map_think_effort(thv, think_effort);
@@ -612,9 +694,12 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
         int64_t created_ts = static_cast<int64_t>(std::time(nullptr));
         char id_buf[64];
-        snprintf(id_buf, sizeof(id_buf), "chatcmpl-%lld-%llu",
+        snprintf(id_buf, sizeof(id_buf), "%s-%lld-%llu",
+                 is_responses ? "resp" : "chatcmpl",
                  static_cast<long long>(created_ts), static_cast<unsigned long long>(req_counter));
         std::string comp_id(id_buf);
+        std::string rs_item_id = "rs_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
+        std::string msg_item_id = "msg_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
 
         // Speculative decoding is used when enabled and greedy (temperature == 0);
         // non-zero temperature automatically falls back to exact plain sampling.
@@ -624,7 +709,75 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         parser.init(engine.tokenizer, stops);
         StreamChunkBuilder scb{comp_id, created_ts, req_model};
 
+        // Responses API streaming state
         bool client_ok = true;
+        int resp_seq_num = 0;
+        int resp_next_out_idx = 0;
+        bool resp_rs_open = false;
+        bool resp_rs_closed = false;
+        int resp_rs_idx = 0;
+        bool resp_msg_open = false;
+        int resp_msg_idx = 0;
+
+        auto send_resp_sse = [&](const char* event_name, const std::string& extra_fields) -> bool {
+            if (!client_ok) return false;
+            std::ostringstream oss;
+            oss << "event: " << event_name << "\n"
+                << "data: {\"type\":\"" << event_name
+                << "\",\"sequence_number\":" << (resp_seq_num++);
+            if (!extra_fields.empty()) oss << "," << extra_fields;
+            oss << "}\n\n";
+            client_ok = send_str(client_fd, oss.str());
+            return client_ok;
+        };
+
+        auto build_resp_object = [&](const char* status_str, const std::string& output_json,
+                                     const std::string& output_text_str, const std::string& usage_json) {
+            std::ostringstream oss;
+            oss << "{\"id\":\"" << comp_id
+                << "\",\"object\":\"response\",\"created_at\":" << created_ts
+                << ",\"status\":\"" << status_str
+                << "\",\"model\":\"" << json_escape(req_model)
+                << "\",\"output\":" << output_json;
+            if (!output_text_str.empty() || std::strcmp(status_str, "in_progress") != 0) {
+                oss << ",\"output_text\":\"" << json_escape(output_text_str) << "\"";
+            }
+            if (!usage_json.empty()) oss << ",\"usage\":" << usage_json;
+            oss << "}";
+            return oss.str();
+        };
+
+        auto close_resp_reasoning = [&]() {
+            if (!resp_rs_open || resp_rs_closed) return;
+            resp_rs_closed = true;
+            std::string esc_r = json_escape(parser.reasoning_acc);
+            send_resp_sse("response.reasoning_summary_text.done",
+                          "\"item_id\":\"" + rs_item_id + "\",\"output_index\":" + std::to_string(resp_rs_idx) +
+                              ",\"summary_index\":0,\"text\":\"" + esc_r + "\"");
+            send_resp_sse("response.reasoning_summary_part.done",
+                          "\"item_id\":\"" + rs_item_id + "\",\"output_index\":" + std::to_string(resp_rs_idx) +
+                              ",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"" + esc_r + "\"}");
+            send_resp_sse("response.output_item.done",
+                          "\"output_index\":" + std::to_string(resp_rs_idx) +
+                              ",\"item\":{\"id\":\"" + rs_item_id +
+                              "\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"" +
+                              esc_r + "\"}]}");
+        };
+
+        auto open_resp_message = [&]() {
+            if (resp_msg_open) return;
+            close_resp_reasoning();
+            resp_msg_open = true;
+            resp_msg_idx = resp_next_out_idx++;
+            send_resp_sse("response.output_item.added",
+                          "\"output_index\":" + std::to_string(resp_msg_idx) +
+                              ",\"item\":{\"id\":\"" + msg_item_id +
+                              "\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}");
+            send_resp_sse("response.content_part.added",
+                          "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                              ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}");
+        };
+
         if (stream) {
             std::string sse_hdr =
                 "HTTP/1.1 200 OK\r\n"
@@ -634,13 +787,41 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 "Connection: close\r\n\r\n";
             client_ok = send_str(client_fd, sse_hdr);
             if (client_ok) {
-                client_ok = send_str(client_fd, scb.make_chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr));
+                if (is_responses) {
+                    std::string init_resp = build_resp_object("in_progress", "[]", "", "");
+                    send_resp_sse("response.created", "\"response\":" + init_resp);
+                    send_resp_sse("response.in_progress", "\"response\":" + init_resp);
+                } else {
+                    client_ok = send_str(client_fd, scb.make_chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr));
+                }
             }
         }
 
         auto emit_piece = [&](bool is_reasoning, const std::string& text) -> bool {
             if (!stream || text.empty()) return true;
             if (!client_ok) return false;
+            if (is_responses) {
+                if (is_reasoning) {
+                    if (!resp_rs_open) {
+                        resp_rs_open = true;
+                        resp_rs_idx = resp_next_out_idx++;
+                        send_resp_sse("response.output_item.added",
+                                      "\"output_index\":" + std::to_string(resp_rs_idx) +
+                                          ",\"item\":{\"id\":\"" + rs_item_id +
+                                          "\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}");
+                        send_resp_sse("response.reasoning_summary_part.added",
+                                      "\"item_id\":\"" + rs_item_id + "\",\"output_index\":" + std::to_string(resp_rs_idx) +
+                                          ",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}");
+                    }
+                    return send_resp_sse("response.reasoning_summary_text.delta",
+                                         "\"item_id\":\"" + rs_item_id + "\",\"output_index\":" + std::to_string(resp_rs_idx) +
+                                             ",\"summary_index\":0,\"delta\":\"" + json_escape(text) + "\"");
+                }
+                open_resp_message();
+                return send_resp_sse("response.output_text.delta",
+                                     "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                                         ",\"content_index\":0,\"delta\":\"" + json_escape(text) + "\"");
+            }
             std::string delta = is_reasoning
                                     ? ("{\"reasoning_content\":\"" + json_escape(text) + "\"}")
                                     : ("{\"content\":\"" + json_escape(text) + "\"}");
@@ -674,7 +855,55 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         int prompt_toks = stats.prompt_tokens;
         int comp_toks = stats.gen_tokens;
 
-        if (stream) {
+        if (is_responses) {
+            std::ostringstream out_arr;
+            out_arr << "[";
+            bool first_item = true;
+            if (!parser.reasoning_acc.empty()) {
+                out_arr << "{\"id\":\"" << rs_item_id
+                        << "\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[{\"type\":\"summary_text\",\"text\":\""
+                        << json_escape(parser.reasoning_acc) << "\"}]}";
+                first_item = false;
+            }
+            if (!first_item) out_arr << ",";
+            out_arr << "{\"id\":\"" << msg_item_id
+                    << "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""
+                    << json_escape(parser.content_acc) << "\",\"annotations\":[]}]}]";
+
+            std::ostringstream usage_oss;
+            usage_oss << "{\"input_tokens\":" << prompt_toks
+                      << ",\"output_tokens\":" << comp_toks
+                      << ",\"total_tokens\":" << (prompt_toks + comp_toks)
+                      << ",\"input_tokens_details\":{\"cached_tokens\":0}"
+                      << ",\"output_tokens_details\":{\"reasoning_tokens\":0}}";
+
+            const char* resp_status = (std::strcmp(finish_reason, "stop") == 0) ? "completed" : "incomplete";
+            std::string final_resp = build_resp_object(resp_status, out_arr.str(), parser.content_acc, usage_oss.str());
+
+            if (stream) {
+                if (client_ok) {
+                    close_resp_reasoning();
+                    open_resp_message();
+                    std::string esc_c = json_escape(parser.content_acc);
+                    send_resp_sse("response.output_text.done",
+                                  "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                                      ",\"content_index\":0,\"text\":\"" + esc_c + "\"");
+                    send_resp_sse("response.content_part.done",
+                                  "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                                      ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"" + esc_c +
+                                      "\",\"annotations\":[]}");
+                    send_resp_sse("response.output_item.done",
+                                  "\"output_index\":" + std::to_string(resp_msg_idx) +
+                                      ",\"item\":{\"id\":\"" + msg_item_id +
+                                      "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"" +
+                                      esc_c + "\",\"annotations\":[]}]}");
+                    send_resp_sse(std::strcmp(resp_status, "completed") == 0 ? "response.completed" : "response.incomplete",
+                                  "\"response\":" + final_resp);
+                }
+            } else {
+                send_http_json(client_fd, 200, "OK", final_resp);
+            }
+        } else if (stream) {
             if (client_ok) {
                 send_str(client_fd, scb.make_chunk("{}", finish_reason));
                 if (include_usage) {
