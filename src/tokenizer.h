@@ -4,10 +4,19 @@
 #include <unordered_map>
 #include <vector>
 
+struct ChatToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json; // JSON object string
+};
+
 struct ChatMessage {
     std::string role;
     std::string content;
     std::string reasoning_content;
+    std::string tool_name;    // For role=="tool"
+    std::string tool_call_id; // For role=="tool"
+    std::vector<ChatToolCall> tool_calls; // For role=="assistant"
 };
 
 class InklingTokenizer {
@@ -18,10 +27,11 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const;
     std::string decode_token(int32_t id) const;
 
-    // Render standard Inkling 2 prompt for single user prompt or multi-turn messages
+    // Render standard Inkling 2 prompt for single user prompt or multi-turn messages (+ optional tool declarations JSON)
     static std::string render_prompt(const std::string& user_prompt, const std::string& think_effort = "0");
     static std::string render_messages(const std::vector<ChatMessage>& messages,
-                                       const std::string& think_effort = "0");
+                                       const std::string& think_effort = "0",
+                                       const std::string& tools_declare_json = "");
 
     int32_t eos_id() const { return 200006; } // <|content_model_end_sampling|>
     int32_t end_message_id() const { return end_message_id_; }

@@ -262,13 +262,35 @@ std::string InklingTokenizer::decode(const std::vector<int32_t>& ids) const {
 }
 
 std::string InklingTokenizer::render_prompt(const std::string& user_prompt, const std::string& think_effort) {
-    return render_messages({{"user", user_prompt, ""}}, think_effort);
+    ChatMessage m;
+    m.role = "user";
+    m.content = user_prompt;
+    return render_messages({m}, think_effort);
 }
 
 std::string InklingTokenizer::render_messages(const std::vector<ChatMessage>& messages,
-                                              const std::string& think_effort) {
+                                              const std::string& think_effort,
+                                              const std::string& tools_declare_json) {
     // Matches ollama/model/renderers/inkling2.go Render()
     std::string out;
+    if (!tools_declare_json.empty()) {
+        out += "<|message_system|>tool_declare<|content_xml|>";
+        out += tools_declare_json;
+        out += "<|end_message|>";
+    }
+
+    // Map tool_call_id -> tool name for tool response messages that omit tool_name
+    std::unordered_map<std::string, std::string> call_id_to_name;
+    for (const auto& msg : messages) {
+        if (msg.role == "assistant") {
+            for (const auto& tc : msg.tool_calls) {
+                if (!tc.id.empty() && !tc.name.empty()) {
+                    call_id_to_name[tc.id] = tc.name;
+                }
+            }
+        }
+    }
+
     bool effort_emitted = false;
     auto write_effort = [&]() {
         out += "<|message_system|><|content_text|>Thinking effort level: ";
@@ -287,7 +309,12 @@ std::string InklingTokenizer::render_messages(const std::vector<ChatMessage>& me
         } else if (msg.role == "assistant") {
             role_tag = "<|message_model|>";
         } else if (msg.role == "tool") {
-            role_tag = "<|message_tool|>";
+            std::string tname = msg.tool_name;
+            if (tname.empty() && !msg.tool_call_id.empty()) {
+                auto it = call_id_to_name.find(msg.tool_call_id);
+                if (it != call_id_to_name.end()) tname = it->second;
+            }
+            role_tag = "<|message_tool|>" + tname;
         } else {
             role_tag = "<|message_user|>";
         }
@@ -301,13 +328,24 @@ std::string InklingTokenizer::render_messages(const std::vector<ChatMessage>& me
             out += msg.reasoning_content;
             out += "<|end_message|>";
         }
-        if (!msg.content.empty() || !(msg.role == "assistant" && !msg.reasoning_content.empty())) {
+        bool has_extra = (msg.role == "assistant" && (!msg.tool_calls.empty() || !msg.reasoning_content.empty()));
+        if (!msg.content.empty() || !has_extra) {
             out += role_tag;
             out += "<|content_text|>";
             out += msg.content;
             out += "<|end_message|>";
         }
         if (msg.role == "assistant") {
+            for (const auto& tc : msg.tool_calls) {
+                std::string args = tc.arguments_json.empty() ? "{}" : tc.arguments_json;
+                out += "<|message_model|>";
+                out += tc.name;
+                out += "<|content_invoke_tool_json|>{\"name\":\"";
+                out += json_lite::escape_string(tc.name);
+                out += "\",\"args\":";
+                out += args;
+                out += "}<|end_message|>";
+            }
             out += "<|content_model_end_sampling|>";
         }
     }

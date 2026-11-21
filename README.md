@@ -70,7 +70,7 @@ make format
 
 ### OpenAI-Compatible API (`--serve`)
 
-Supports `GET /health`, `GET /v1/models` (exposing `context_length` / `max_model_len`, default **262,144** with dynamic grow-on-demand global KV caches; configurable via `--max-seq`), `POST /v1/chat/completions`, and `POST /v1/responses` (both non-streaming JSON and SSE streaming, `reasoning_content` / `reasoning` + `content` / `output_text`, multi-turn messages, `max_tokens`/`max_output_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`).
+Supports `GET /health`, `GET /props`, `GET /v1/models` (exposing `context_length` / `max_model_len`, default **262,144** with dynamic grow-on-demand global KV caches; configurable via `--max-seq`), `POST /v1/chat/completions`, and `POST /v1/responses` (both non-streaming JSON and SSE streaming, `reasoning_content` / `reasoning` + `content` / `output_text`, **native Inkling 2 tool calling** via `tools` / `tool_calls` / `function_call` / `function_call_output`, multi-turn messages, `max_tokens`/`max_output_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`).
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \

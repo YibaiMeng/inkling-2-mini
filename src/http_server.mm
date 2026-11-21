@@ -261,56 +261,160 @@ struct StreamChunkBuilder {
     }
 };
 
+// Serialize OpenAI `tools` array (either Chat Completions or Responses format) into Inkling 2's
+// compact tool_declare JSON array matching ollama/model/renderers/inkling2.go.
+std::string build_tools_declare_json(const json_lite::Value* tools_val) {
+    if (!tools_val || !tools_val->is_array() || tools_val->as_array().empty()) return "";
+    json_lite::Array specs;
+    for (const auto& t : tools_val->as_array()) {
+        if (!t.is_object()) continue;
+        std::string kind = "function";
+        if (const auto* kv = t.get("type"); kv && kv->is_string() && !kv->as_string().empty()) {
+            kind = kv->as_string();
+        }
+        const json_lite::Value* fn_obj = t.get("function");
+        const json_lite::Value& src = (fn_obj && fn_obj->is_object()) ? *fn_obj : t;
+
+        const auto* name_v = src.get("name");
+        if (!name_v || !name_v->is_string() || name_v->as_string().empty()) continue;
+
+        json_lite::Object spec;
+        spec["name"] = json_lite::Value(name_v->as_string());
+        spec["type"] = json_lite::Value(kind);
+        if (const auto* desc_v = src.get("description"); desc_v && desc_v->is_string()) {
+            spec["description"] = json_lite::Value(desc_v->as_string());
+        } else {
+            spec["description"] = json_lite::Value(std::string(""));
+        }
+        if (const auto* params_v = src.get("parameters"); params_v && params_v->is_object()) {
+            spec["parameters"] = *params_v;
+        } else {
+            spec["parameters"] = json_lite::Value(json_lite::Object{});
+        }
+        specs.emplace_back(std::move(spec));
+    }
+    if (specs.empty()) return "";
+    return json_lite::dump_compact(json_lite::Value(std::move(specs)));
+}
+
 struct OutputChannelParser {
-    enum class Mode { Idle, Thinking, Text };
+    enum class Mode { Idle, ModelHeader, Thinking, Text, ToolJson, ToolIgnore };
 
     int32_t tok_msg_model = -1;
     int32_t tok_thinking = -1;
     int32_t tok_text = -1;
+    int32_t tok_tool_json = -1;
+    int32_t tok_tool_text = -1;
+    int32_t tok_tool_error = -1;
     int32_t tok_end_msg = -1;
     int32_t tok_eos = -1;
 
     Mode mode = Mode::Idle;
     std::string utf8_buf;
+    std::string header_name;
+    std::string tool_json_buf;
     std::string text_pending;
     std::string reasoning_acc;
     std::string content_acc;
+    std::vector<ChatToolCall> tool_calls;
+    std::string call_id_prefix;
     std::vector<std::string> stops;
     size_t max_stop_len = 0;
     bool hit_stop = false;
 
-    void init(const InklingTokenizer& tok, const std::vector<std::string>& stop_list) {
-        tok_msg_model = tok.token_id("<|message_model|>");
-        tok_thinking  = tok.token_id("<|content_thinking|>");
-        tok_text      = tok.token_id("<|content_text|>");
-        tok_end_msg   = tok.token_id("<|end_message|>");
-        tok_eos       = tok.eos_id();
+    void init(const InklingTokenizer& tok, const std::vector<std::string>& stop_list,
+              const std::string& id_prefix) {
+        tok_msg_model  = tok.token_id("<|message_model|>");
+        tok_thinking   = tok.token_id("<|content_thinking|>");
+        tok_text       = tok.token_id("<|content_text|>");
+        tok_tool_json  = tok.token_id("<|content_invoke_tool_json|>");
+        tok_tool_text  = tok.token_id("<|content_invoke_tool_text|>");
+        tok_tool_error = tok.token_id("<|content_tool_error|>");
+        tok_end_msg    = tok.token_id("<|end_message|>");
+        tok_eos        = tok.eos_id();
+        call_id_prefix = id_prefix;
         stops = stop_list;
         max_stop_len = 0;
         for (const auto& st : stops) max_stop_len = std::max(max_stop_len, st.size());
     }
 
-    // Feed one token ID. Emits ready text via `emit(is_reasoning, chunk)`.
+    template <typename ToolFn>
+    bool finalize_tool_call(ToolFn&& on_tool) {
+        if (tool_json_buf.empty()) return true;
+        std::string raw;
+        raw.swap(tool_json_buf);
+        std::string name = header_name;
+        std::string args_json = "{}";
+        try {
+            json_lite::Value v = json_lite::parse(raw);
+            if (v.is_object()) {
+                if (const auto* nv = v.get("name"); nv && nv->is_string() && !nv->as_string().empty()) {
+                    name = nv->as_string();
+                }
+                if (const auto* av = v.get("args")) {
+                    args_json = json_lite::dump_compact(*av);
+                } else if (const auto* av2 = v.get("arguments")) {
+                    args_json = av2->is_string() ? av2->as_string() : json_lite::dump_compact(*av2);
+                }
+            }
+        } catch (...) {
+            // Best-effort fallback if truncated near max_tokens
+            if (name.empty()) return true;
+        }
+        if (name.empty()) return true;
+
+        size_t idx = tool_calls.size();
+        ChatToolCall tc;
+        tc.id = call_id_prefix + "_" + std::to_string(idx);
+        tc.name = std::move(name);
+        tc.arguments_json = std::move(args_json);
+        tool_calls.push_back(tc);
+        return on_tool(tc, idx);
+    }
+
+    // Feed one token ID. Emits ready text via `emit(is_reasoning, chunk)` and tool calls via `on_tool(tc, idx)`.
     // Returns false if generation should stop (EOS, stop sequence, or emit failed).
-    template <typename EmitFn>
-    bool feed(const InklingTokenizer& tok, int32_t id, EmitFn&& emit) {
+    template <typename EmitFn, typename ToolFn>
+    bool feed(const InklingTokenizer& tok, int32_t id, EmitFn&& emit, ToolFn&& on_tool) {
         if (id == tok_eos) {
-            flush_all(emit);
+            flush_all(emit, on_tool);
             return false;
+        }
+        if (id == tok_msg_model) {
+            flush_utf8(emit);
+            if (mode == Mode::ToolJson && !finalize_tool_call(on_tool)) return false;
+            mode = Mode::ModelHeader;
+            header_name.clear();
+            return true;
         }
         if (id == tok_thinking) {
             flush_utf8(emit);
             mode = Mode::Thinking;
+            header_name.clear();
             return true;
         }
         if (id == tok_text) {
             flush_utf8(emit);
             mode = Mode::Text;
+            header_name.clear();
             return true;
         }
-        if (id == tok_msg_model || id == tok_end_msg) {
+        if (id == tok_tool_json) {
             flush_utf8(emit);
+            mode = Mode::ToolJson;
+            tool_json_buf.clear();
+            return true;
+        }
+        if (id == tok_tool_text || id == tok_tool_error) {
+            flush_utf8(emit);
+            mode = Mode::ToolIgnore;
+            return true;
+        }
+        if (id == tok_end_msg) {
+            flush_utf8(emit);
+            if (mode == Mode::ToolJson && !finalize_tool_call(on_tool)) return false;
             mode = Mode::Idle;
+            header_name.clear();
             return true;
         }
         if (tok.is_special(id)) {
@@ -319,8 +423,20 @@ struct OutputChannelParser {
 
         std::string piece = tok.decode_token(id);
         if (piece.empty()) return true;
-        utf8_buf += piece;
 
+        if (mode == Mode::ModelHeader) {
+            header_name += piece;
+            return true;
+        }
+        if (mode == Mode::ToolJson) {
+            tool_json_buf += piece;
+            return true;
+        }
+        if (mode == Mode::ToolIgnore) {
+            return true;
+        }
+
+        utf8_buf += piece;
         size_t ready = valid_utf8_prefix_len(utf8_buf);
         if (ready == 0) return true;
         std::string valid = utf8_buf.substr(0, ready);
@@ -334,7 +450,6 @@ struct OutputChannelParser {
         // Text mode (or Idle fallback)
         text_pending += valid;
         if (!stops.empty()) {
-            // Check if any stop string appears inside text_pending
             size_t earliest = std::string::npos;
             for (const auto& st : stops) {
                 if (st.empty()) continue;
@@ -351,7 +466,6 @@ struct OutputChannelParser {
                 }
                 return false;
             }
-            // Hold back up to max_stop_len - 1 bytes in case a stop sequence spans tokens
             if (text_pending.size() >= max_stop_len) {
                 size_t emit_len = text_pending.size() - (max_stop_len - 1);
                 emit_len = valid_utf8_prefix_len(text_pending.substr(0, emit_len));
@@ -385,9 +499,13 @@ struct OutputChannelParser {
         }
     }
 
-    template <typename EmitFn>
-    void flush_all(EmitFn&& emit) {
+    template <typename EmitFn, typename ToolFn>
+    void flush_all(EmitFn&& emit, ToolFn&& on_tool) {
         flush_utf8(emit);
+        if (mode == Mode::ToolJson) {
+            finalize_tool_call(on_tool);
+            mode = Mode::Idle;
+        }
         if (!text_pending.empty()) {
             std::string rem;
             rem.swap(text_pending);
@@ -542,7 +660,10 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         std::vector<ChatMessage> messages;
         if (is_responses) {
             if (const auto* inst = root.get("instructions"); inst && inst->is_string() && !inst->as_string().empty()) {
-                messages.push_back({"system", inst->as_string(), ""});
+                ChatMessage sm;
+                sm.role = "system";
+                sm.content = inst->as_string();
+                messages.push_back(std::move(sm));
             }
             const auto* inp = root.get("input");
             if (!inp) inp = root.get("messages");
@@ -552,11 +673,17 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 continue;
             }
             if (inp->is_string()) {
-                messages.push_back({"user", inp->as_string(), ""});
+                ChatMessage um;
+                um.role = "user";
+                um.content = inp->as_string();
+                messages.push_back(std::move(um));
             } else if (inp->is_array()) {
                 for (const auto& item : inp->as_array()) {
                     if (item.is_string()) {
-                        messages.push_back({"user", item.as_string(), ""});
+                        ChatMessage um;
+                        um.role = "user";
+                        um.content = item.as_string();
+                        messages.push_back(std::move(um));
                         continue;
                     }
                     if (!item.is_object()) continue;
@@ -568,15 +695,34 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                         continue;
                     }
                     if (itype == "function_call_output") {
-                        std::string out_txt = extract_content_string(item.get("output"));
-                        messages.push_back({"tool", out_txt, ""});
+                        ChatMessage tm;
+                        tm.role = "tool";
+                        tm.content = extract_content_string(item.get("output"));
+                        if (const auto* cid = item.get("call_id"); cid && cid->is_string()) {
+                            tm.tool_call_id = cid->as_string();
+                        }
+                        if (const auto* nv = item.get("name"); nv && nv->is_string()) {
+                            tm.tool_name = nv->as_string();
+                        }
+                        messages.push_back(std::move(tm));
                         continue;
                     }
                     if (itype == "function_call") {
-                        std::string fn_name, fn_args;
-                        if (const auto* nv = item.get("name"); nv && nv->is_string()) fn_name = nv->as_string();
-                        if (const auto* av = item.get("arguments"); av && av->is_string()) fn_args = av->as_string();
-                        messages.push_back({"assistant", fn_name + "(" + fn_args + ")", ""});
+                        ChatToolCall tc;
+                        if (const auto* cid = item.get("call_id"); cid && cid->is_string()) tc.id = cid->as_string();
+                        else if (const auto* idv = item.get("id"); idv && idv->is_string()) tc.id = idv->as_string();
+                        if (const auto* nv = item.get("name"); nv && nv->is_string()) tc.name = nv->as_string();
+                        if (const auto* av = item.get("arguments")) {
+                            tc.arguments_json = av->is_string() ? av->as_string() : json_lite::dump_compact(*av);
+                        }
+                        if (!messages.empty() && messages.back().role == "assistant") {
+                            messages.back().tool_calls.push_back(std::move(tc));
+                        } else {
+                            ChatMessage am;
+                            am.role = "assistant";
+                            am.tool_calls.push_back(std::move(tc));
+                            messages.push_back(std::move(am));
+                        }
                         continue;
                     }
                     ChatMessage cm;
@@ -612,11 +758,37 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 const auto* rv = m.get("role");
                 cm.role = (rv && rv->is_string()) ? rv->as_string() : "user";
                 cm.content = extract_content_string(m.get("content"));
-                const auto* rcv = m.get("reasoning_content");
-                if (rcv && rcv->is_string()) cm.reasoning_content = rcv->as_string();
+                if (const auto* rcv = m.get("reasoning_content"); rcv && rcv->is_string()) {
+                    cm.reasoning_content = rcv->as_string();
+                }
+                if (const auto* nv = m.get("name"); nv && nv->is_string()) {
+                    cm.tool_name = nv->as_string();
+                }
+                if (const auto* cid = m.get("tool_call_id"); cid && cid->is_string()) {
+                    cm.tool_call_id = cid->as_string();
+                }
+                if (const auto* tcs = m.get("tool_calls"); tcs && tcs->is_array()) {
+                    for (const auto& tci : tcs->as_array()) {
+                        if (!tci.is_object()) continue;
+                        ChatToolCall tc;
+                        if (const auto* idv = tci.get("id"); idv && idv->is_string()) tc.id = idv->as_string();
+                        const auto* fn = tci.get("function");
+                        const auto& src = (fn && fn->is_object()) ? *fn : tci;
+                        if (const auto* fn_name = src.get("name"); fn_name && fn_name->is_string()) {
+                            tc.name = fn_name->as_string();
+                        }
+                        if (const auto* fn_args = src.get("arguments")) {
+                            tc.arguments_json = fn_args->is_string() ? fn_args->as_string()
+                                                                     : json_lite::dump_compact(*fn_args);
+                        }
+                        if (!tc.name.empty()) cm.tool_calls.push_back(std::move(tc));
+                    }
+                }
                 messages.push_back(std::move(cm));
             }
         }
+
+        std::string tools_declare_json = build_tools_declare_json(root.get("tools"));
 
         std::string req_model = cfg.model_name;
         if (const auto* mv = root.get("model"); mv && mv->is_string() && !mv->as_string().empty()) {
@@ -682,7 +854,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             think_effort = map_think_effort(thv, think_effort);
         }
 
-        std::string rendered = InklingTokenizer::render_messages(messages, think_effort);
+        std::string rendered = InklingTokenizer::render_messages(messages, think_effort, tools_declare_json);
         std::vector<int32_t> prompt_ids = engine.tokenizer.encode(rendered);
         if (static_cast<int>(prompt_ids.size()) + 1 >= cfg.max_seq) {
             send_openai_error(client_fd, 400, "Bad Request",
@@ -700,13 +872,14 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         std::string comp_id(id_buf);
         std::string rs_item_id = "rs_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
         std::string msg_item_id = "msg_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
+        std::string call_id_prefix = "call_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
 
         // Speculative decoding is used when enabled and greedy (temperature == 0);
         // non-zero temperature automatically falls back to exact plain sampling.
         bool run_spec = cfg.use_spec && engine.weights.draft.loaded && sampling.temperature <= 0.0f;
 
         OutputChannelParser parser;
-        parser.init(engine.tokenizer, stops);
+        parser.init(engine.tokenizer, stops, call_id_prefix);
         StreamChunkBuilder scb{comp_id, created_ts, req_model};
 
         // Responses API streaming state
@@ -717,6 +890,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         bool resp_rs_closed = false;
         int resp_rs_idx = 0;
         bool resp_msg_open = false;
+        bool resp_msg_closed = false;
         int resp_msg_idx = 0;
 
         auto send_resp_sse = [&](const char* event_name, const std::string& extra_fields) -> bool {
@@ -778,6 +952,24 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                               ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}");
         };
 
+        auto close_resp_message = [&]() {
+            if (!resp_msg_open || resp_msg_closed) return;
+            resp_msg_closed = true;
+            std::string esc_c = json_escape(parser.content_acc);
+            send_resp_sse("response.output_text.done",
+                          "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                              ",\"content_index\":0,\"text\":\"" + esc_c + "\"");
+            send_resp_sse("response.content_part.done",
+                          "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
+                              ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"" + esc_c +
+                              "\",\"annotations\":[]}");
+            send_resp_sse("response.output_item.done",
+                          "\"output_index\":" + std::to_string(resp_msg_idx) +
+                              ",\"item\":{\"id\":\"" + msg_item_id +
+                              "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"" +
+                              esc_c + "\",\"annotations\":[]}]}");
+        };
+
         if (stream) {
             std::string sse_hdr =
                 "HTTP/1.1 200 OK\r\n"
@@ -829,8 +1021,46 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             return client_ok;
         };
 
+        auto emit_tool_call = [&](const ChatToolCall& tc, size_t idx) -> bool {
+            if (!stream) return true;
+            if (!client_ok) return false;
+            if (is_responses) {
+                close_resp_reasoning();
+                close_resp_message();
+                int fc_idx = resp_next_out_idx++;
+                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_counter) + "_" +
+                                    std::to_string(idx);
+                std::string esc_name = json_escape(tc.name);
+                std::string esc_args = json_escape(tc.arguments_json);
+                send_resp_sse("response.output_item.added",
+                              "\"output_index\":" + std::to_string(fc_idx) +
+                                  ",\"item\":{\"id\":\"" + fc_id +
+                                  "\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"" +
+                                  json_escape(tc.id) + "\",\"name\":\"" + esc_name + "\",\"arguments\":\"\"}");
+                send_resp_sse("response.function_call_arguments.delta",
+                              "\"item_id\":\"" + fc_id + "\",\"output_index\":" + std::to_string(fc_idx) +
+                                  ",\"delta\":\"" + esc_args + "\"");
+                send_resp_sse("response.function_call_arguments.done",
+                              "\"item_id\":\"" + fc_id + "\",\"output_index\":" + std::to_string(fc_idx) +
+                                  ",\"name\":\"" + esc_name + "\",\"arguments\":\"" + esc_args + "\"");
+                return send_resp_sse("response.output_item.done",
+                                     "\"output_index\":" + std::to_string(fc_idx) +
+                                         ",\"item\":{\"id\":\"" + fc_id +
+                                         "\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"" +
+                                         json_escape(tc.id) + "\",\"name\":\"" + esc_name + "\",\"arguments\":\"" +
+                                         esc_args + "\"}");
+            }
+            std::ostringstream doss;
+            doss << "{\"tool_calls\":[{\"index\":" << idx
+                 << ",\"id\":\"" << json_escape(tc.id)
+                 << "\",\"type\":\"function\",\"function\":{\"name\":\"" << json_escape(tc.name)
+                 << "\",\"arguments\":\"" << json_escape(tc.arguments_json) << "\"}}]}";
+            client_ok = send_str(client_fd, scb.make_chunk(doss.str(), nullptr));
+            return client_ok;
+        };
+
         auto on_token = [&](int32_t tok_id) -> bool {
-            return parser.feed(engine.tokenizer, tok_id, emit_piece);
+            return parser.feed(engine.tokenizer, tok_id, emit_piece, emit_tool_call);
         };
 
         GenStats stats;
@@ -847,11 +1077,12 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
         // Flush any remaining held-back bytes if generation hit max_tokens or EOS
         if (client_ok) {
-            parser.flush_all(emit_piece);
+            parser.flush_all(emit_piece, emit_tool_call);
         }
 
         bool hit_eos = (!out_ids.empty() && out_ids.back() == engine.tokenizer.eos_id());
-        const char* finish_reason = (hit_eos || parser.hit_stop) ? "stop" : "length";
+        bool has_tools = !parser.tool_calls.empty();
+        const char* finish_reason = has_tools ? "tool_calls" : ((hit_eos || parser.hit_stop) ? "stop" : "length");
         int prompt_toks = stats.prompt_tokens;
         int comp_toks = stats.gen_tokens;
 
@@ -865,10 +1096,25 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                         << json_escape(parser.reasoning_acc) << "\"}]}";
                 first_item = false;
             }
-            if (!first_item) out_arr << ",";
-            out_arr << "{\"id\":\"" << msg_item_id
-                    << "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""
-                    << json_escape(parser.content_acc) << "\",\"annotations\":[]}]}]";
+            if (!parser.content_acc.empty() || !has_tools) {
+                if (!first_item) out_arr << ",";
+                out_arr << "{\"id\":\"" << msg_item_id
+                        << "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""
+                        << json_escape(parser.content_acc) << "\",\"annotations\":[]}]}";
+                first_item = false;
+            }
+            for (size_t i = 0; i < parser.tool_calls.size(); ++i) {
+                const auto& tc = parser.tool_calls[i];
+                if (!first_item) out_arr << ",";
+                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_counter) + "_" +
+                                    std::to_string(i);
+                out_arr << "{\"id\":\"" << fc_id
+                        << "\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""
+                        << json_escape(tc.id) << "\",\"name\":\"" << json_escape(tc.name)
+                        << "\",\"arguments\":\"" << json_escape(tc.arguments_json) << "\"}";
+                first_item = false;
+            }
+            out_arr << "]";
 
             std::ostringstream usage_oss;
             usage_oss << "{\"input_tokens\":" << prompt_toks
@@ -877,27 +1123,16 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                       << ",\"input_tokens_details\":{\"cached_tokens\":0}"
                       << ",\"output_tokens_details\":{\"reasoning_tokens\":0}}";
 
-            const char* resp_status = (std::strcmp(finish_reason, "stop") == 0) ? "completed" : "incomplete";
+            bool completed = (hit_eos || parser.hit_stop || has_tools);
+            const char* resp_status = completed ? "completed" : "incomplete";
             std::string final_resp = build_resp_object(resp_status, out_arr.str(), parser.content_acc, usage_oss.str());
 
             if (stream) {
                 if (client_ok) {
                     close_resp_reasoning();
-                    open_resp_message();
-                    std::string esc_c = json_escape(parser.content_acc);
-                    send_resp_sse("response.output_text.done",
-                                  "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
-                                      ",\"content_index\":0,\"text\":\"" + esc_c + "\"");
-                    send_resp_sse("response.content_part.done",
-                                  "\"item_id\":\"" + msg_item_id + "\",\"output_index\":" + std::to_string(resp_msg_idx) +
-                                      ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"" + esc_c +
-                                      "\",\"annotations\":[]}");
-                    send_resp_sse("response.output_item.done",
-                                  "\"output_index\":" + std::to_string(resp_msg_idx) +
-                                      ",\"item\":{\"id\":\"" + msg_item_id +
-                                      "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"" +
-                                      esc_c + "\",\"annotations\":[]}]}");
-                    send_resp_sse(std::strcmp(resp_status, "completed") == 0 ? "response.completed" : "response.incomplete",
+                    if (!has_tools && !resp_msg_open) open_resp_message();
+                    close_resp_message();
+                    send_resp_sse(completed ? "response.completed" : "response.incomplete",
                                   "\"response\":" + final_resp);
                 }
             } else {
@@ -925,10 +1160,25 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             body << "{\"id\":\"" << comp_id
                  << "\",\"object\":\"chat.completion\",\"created\":" << created_ts
                  << ",\"model\":\"" << json_escape(req_model)
-                 << "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""
-                 << json_escape(parser.content_acc) << "\"";
+                 << "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
+            if (parser.content_acc.empty() && has_tools) {
+                body << "null";
+            } else {
+                body << "\"" << json_escape(parser.content_acc) << "\"";
+            }
             if (!parser.reasoning_acc.empty()) {
                 body << ",\"reasoning_content\":\"" << json_escape(parser.reasoning_acc) << "\"";
+            }
+            if (has_tools) {
+                body << ",\"tool_calls\":[";
+                for (size_t i = 0; i < parser.tool_calls.size(); ++i) {
+                    const auto& tc = parser.tool_calls[i];
+                    if (i > 0) body << ",";
+                    body << "{\"id\":\"" << json_escape(tc.id)
+                         << "\",\"type\":\"function\",\"function\":{\"name\":\"" << json_escape(tc.name)
+                         << "\",\"arguments\":\"" << json_escape(tc.arguments_json) << "\"}}";
+                }
+                body << "]";
             }
             body << "},\"logprobs\":null,\"finish_reason\":\"" << finish_reason << "\"}]"
                  << ",\"usage\":{\"prompt_tokens\":" << prompt_toks
