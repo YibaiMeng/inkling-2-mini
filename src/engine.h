@@ -7,6 +7,22 @@
 #include <string>
 #include <vector>
 
+struct PrefixSnapshot {
+    int pos = 0;
+    bool has_draft = false;
+    std::vector<int32_t> tokens;
+    std::vector<std::vector<uint8_t>> local_k, local_v;
+    std::vector<std::vector<uint8_t>> conv_k, conv_v, conv_attn, conv_mlp;
+    std::vector<std::vector<uint8_t>> draft_local_k, draft_local_v;
+    std::vector<uint8_t> draft_last_feature;
+
+    void clear() {
+        pos = 0;
+        has_draft = false;
+        tokens.clear();
+    }
+};
+
 struct SequenceState {
     int pos = 0;
     int max_global_seq = 0;     // Currently allocated global KV capacity (grows dynamically)
@@ -35,10 +51,17 @@ struct SequenceState {
     // Each entry: 4 taps [4, 2304] BF16
     std::vector<uint16_t> pending_taps;
     int pending_count = 0;
+
+    // Exact prefix cache state (live token history + 2 lightweight local-ring/conv checkpoints)
+    bool live_has_draft = false;
+    std::vector<int32_t> cached_tokens;
+    PrefixSnapshot sys_snap;    // End of system + tools prefix
+    PrefixSnapshot prompt_snap; // End of last prefilled prompt
 };
 
 struct GenStats {
     int prompt_tokens = 0;
+    int cached_tokens = 0;
     int gen_tokens = 0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
@@ -114,7 +137,9 @@ public:
                                         GenStats& stats,
                                         bool stream_stdout = false,
                                         const SamplingParams& sampling = {},
-                                        const TokenCallback& on_token = nullptr);
+                                        const TokenCallback& on_token = nullptr,
+                                        bool reuse_prefix = false,
+                                        int sys_prefix_len = 0);
 
     // draft_depth == 0 enables online adaptive speculative depth controller; 1..7 fixes depth.
     std::vector<int32_t> generate_speculative(SequenceState& seq,
@@ -123,7 +148,9 @@ public:
                                               int draft_depth,
                                               GenStats& stats,
                                               bool stream_stdout = false,
-                                              const TokenCallback& on_token = nullptr);
+                                              const TokenCallback& on_token = nullptr,
+                                              bool reuse_prefix = false,
+                                              int sys_prefix_len = 0);
 
     // Multi-sequence parallel low-batch generation (B = 1..8)
     std::vector<std::vector<int32_t>> generate_batch(const std::vector<std::vector<int32_t>>& prompts,
@@ -287,6 +314,12 @@ private:
     int32_t sample_logits_cpu(const float* logits,
                               const SamplingParams& sampling,
                               uint64_t& rng_state) const;
+
+    void save_prefix_snapshot(const SequenceState& seq, PrefixSnapshot& snap, bool include_draft) const;
+    void restore_prefix_snapshot(SequenceState& seq, const PrefixSnapshot& snap) const;
+    int prepare_prefix_cache(SequenceState& seq,
+                             const std::vector<int32_t>& prompt_ids,
+                             bool need_draft);
 
     void precompute_draft_folded();
 };

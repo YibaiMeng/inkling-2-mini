@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -105,6 +107,11 @@ std::string to_lower_ascii(std::string s) {
 bool read_http_request(int fd, HttpRequest& req) {
     constexpr size_t kMaxHeaderBytes = 64 * 1024;
     constexpr size_t kMaxBodyBytes = 64 * 1024 * 1024;
+
+    // Prevent idle/half-open TCP connections from blocking forever
+    timeval rtv{15, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
     std::string buf;
     buf.reserve(4096);
     char tmp[4096];
@@ -134,6 +141,7 @@ bool read_http_request(int fd, HttpRequest& req) {
     if (qpos != std::string::npos) req.path.resize(qpos);
 
     size_t content_length = 0;
+    bool is_chunked = false;
     bool expect_continue = false;
     size_t pos = (line_end == std::string::npos) ? header_block.size() : line_end + 2;
     while (pos < header_block.size()) {
@@ -147,6 +155,8 @@ bool read_http_request(int fd, HttpRequest& req) {
             val = (vs == std::string::npos) ? "" : val.substr(vs);
             if (key == "content-length") {
                 content_length = static_cast<size_t>(std::strtoull(val.c_str(), nullptr, 10));
+            } else if (key == "transfer-encoding" && to_lower_ascii(val).find("chunked") != std::string::npos) {
+                is_chunked = true;
             } else if (key == "expect" && to_lower_ascii(val).find("100-continue") != std::string::npos) {
                 expect_continue = true;
             }
@@ -160,7 +170,39 @@ bool read_http_request(int fd, HttpRequest& req) {
         send_str(fd, "HTTP/1.1 100 Continue\r\n\r\n");
     }
 
-    req.body = buf.substr(header_end + 4);
+    std::string raw = buf.substr(header_end + 4);
+    if (is_chunked) {
+        req.body.clear();
+        size_t cursor = 0;
+        auto fill_more = [&]() -> bool {
+            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+            if (n < 0) return errno == EINTR;
+            if (n == 0) return false;
+            raw.append(tmp, static_cast<size_t>(n));
+            return raw.size() <= kMaxBodyBytes + 65536;
+        };
+        while (true) {
+            size_t crlf = std::string::npos;
+            while ((crlf = raw.find("\r\n", cursor)) == std::string::npos) {
+                if (!fill_more()) return false;
+            }
+            std::string sz_line = raw.substr(cursor, crlf - cursor);
+            size_t semi = sz_line.find(';');
+            if (semi != std::string::npos) sz_line.resize(semi);
+            size_t chunk_len = static_cast<size_t>(std::strtoull(sz_line.c_str(), nullptr, 16));
+            cursor = crlf + 2;
+            if (chunk_len == 0) break;
+            if (req.body.size() + chunk_len > kMaxBodyBytes) return false;
+            while (raw.size() < cursor + chunk_len + 2) {
+                if (!fill_more()) return false;
+            }
+            req.body.append(raw.data() + cursor, chunk_len);
+            cursor += chunk_len + 2;
+        }
+        return true;
+    }
+
+    req.body = std::move(raw);
     while (req.body.size() < content_length) {
         size_t want = std::min(sizeof(tmp), content_length - req.body.size());
         ssize_t n = recv(fd, tmp, want, 0);
@@ -553,35 +595,35 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
     // Allocate one persistent reusable SequenceState so KV/conv Metal buffers are never reallocated!
     SequenceState seq = engine.create_sequence(cfg.max_seq);
-    uint64_t req_counter = 0;
+    std::mutex gpu_mutex;
+    std::atomic<uint64_t> req_counter{0};
+    std::atomic<int> active_workers{0};
 
     fprintf(stderr,
             "[server] OpenAI-compatible API listening on http://%s:%d\n"
-            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | POST /v1/responses | GET /health\n"
+            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | POST /v1/responses | GET /health | GET /props\n"
             "[server] Model: %s | Max context: %d | Speculative: %s (draft_depth=%s) | Default think: %s\n",
             cfg.host.c_str(), cfg.port, cfg.model_name.c_str(), cfg.max_seq,
             cfg.use_spec ? "on" : "off",
             cfg.draft_depth <= 0 ? "auto" : std::to_string(cfg.draft_depth).c_str(),
             cfg.default_think.c_str());
 
-    while (!g_stop_server.load()) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(server_fd, &rfds);
-        timeval tv{0, 250000}; // 250ms poll for clean SIGINT handling
-        int sel = select(server_fd + 1, &rfds, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
+    auto handle_client = [&](int client_fd) {
+        struct Guard {
+            int fd;
+            std::atomic<int>& cnt;
+            ~Guard() {
+                close(fd);
+                cnt.fetch_sub(1);
+            }
+        } guard{client_fd, active_workers};
 
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-        if (client_fd < 0) continue;
-
+        @autoreleasepool {
         HttpRequest req;
         if (!read_http_request(client_fd, req)) {
-            close(client_fd);
-            continue;
+            return;
         }
+        fprintf(stderr, "[http] %s %s (body=%zu B)\n", req.method.c_str(), req.path.c_str(), req.body.size());
 
         if (req.method == "OPTIONS") {
             send_str(client_fd,
@@ -590,29 +632,26 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                      "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                      "Connection: close\r\n\r\n");
-            close(client_fd);
-            continue;
+            return;
         }
 
-        if (req.method == "GET" && req.path == "/health") {
+        if ((req.method == "GET" || req.method == "HEAD") && req.path == "/health") {
             std::string body = "{\"status\":\"ok\",\"model\":\"" + json_escape(cfg.model_name) +
                                "\",\"context_length\":" + std::to_string(cfg.max_seq) +
                                ",\"speculative\":" + (cfg.use_spec ? "true" : "false") + "}";
-            send_http_json(client_fd, 200, "OK", body);
-            close(client_fd);
-            continue;
+            send_http_json(client_fd, 200, "OK", req.method == "HEAD" ? "" : body);
+            return;
         }
 
-        if (req.method == "GET" && req.path == "/props") {
+        if ((req.method == "GET" || req.method == "HEAD") && req.path == "/props") {
             std::ostringstream oss;
             oss << "{\"default_generation_settings\":{\"n_ctx\":" << cfg.max_seq
                 << "},\"total_slots\":1,\"model_path\":\"" << json_escape(cfg.model_name) << "\"}";
-            send_http_json(client_fd, 200, "OK", oss.str());
-            close(client_fd);
-            continue;
+            send_http_json(client_fd, 200, "OK", req.method == "HEAD" ? "" : oss.str());
+            return;
         }
 
-        if (req.method == "GET" && (req.path == "/v1/models" || req.path == "/models")) {
+        if ((req.method == "GET" || req.method == "HEAD") && (req.path == "/v1/models" || req.path == "/models")) {
             int64_t now_ts = static_cast<int64_t>(std::time(nullptr));
             std::ostringstream oss;
             oss << "{\"object\":\"list\",\"data\":[{\"id\":\"" << json_escape(cfg.model_name)
@@ -623,22 +662,19 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 << ",\"max_context_length\":" << cfg.max_seq
                 << ",\"max_input_tokens\":" << cfg.max_seq
                 << ",\"meta\":{\"n_ctx_train\":" << engine.weights.cfg.model_max_length << "}}]}";
-            send_http_json(client_fd, 200, "OK", oss.str());
-            close(client_fd);
-            continue;
+            send_http_json(client_fd, 200, "OK", req.method == "HEAD" ? "" : oss.str());
+            return;
         }
 
         bool is_chat = (req.path == "/v1/chat/completions" || req.path == "/chat/completions");
         bool is_responses = (req.path == "/v1/responses" || req.path == "/responses");
         if (!is_chat && !is_responses) {
             send_openai_error(client_fd, 404, "Not Found", "Unknown endpoint: " + req.path, "not_found_error");
-            close(client_fd);
-            continue;
+            return;
         }
         if (req.method != "POST") {
             send_openai_error(client_fd, 405, "Method Not Allowed", "Expected POST for " + req.path);
-            close(client_fd);
-            continue;
+            return;
         }
 
         // Parse JSON body (supports both /v1/chat/completions and /v1/responses)
@@ -647,14 +683,12 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             root = json_lite::parse(req.body);
         } catch (const std::exception& e) {
             send_openai_error(client_fd, 400, "Bad Request", std::string("Invalid JSON: ") + e.what());
-            close(client_fd);
-            continue;
+            return;
         }
 
         if (!root.is_object()) {
             send_openai_error(client_fd, 400, "Bad Request", "Request body must be a JSON object");
-            close(client_fd);
-            continue;
+            return;
         }
 
         std::vector<ChatMessage> messages;
@@ -669,8 +703,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             if (!inp) inp = root.get("messages");
             if (!inp || inp->is_null()) {
                 send_openai_error(client_fd, 400, "Bad Request", "Missing 'input' field");
-                close(client_fd);
-                continue;
+                return;
             }
             if (inp->is_string()) {
                 ChatMessage um;
@@ -736,20 +769,17 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 }
             } else {
                 send_openai_error(client_fd, 400, "Bad Request", "'input' must be a string or array");
-                close(client_fd);
-                continue;
+                return;
             }
             if (messages.empty()) {
                 send_openai_error(client_fd, 400, "Bad Request", "Empty 'input' messages");
-                close(client_fd);
-                continue;
+                return;
             }
         } else {
             const auto* msgs_val = root.get("messages");
             if (!msgs_val || !msgs_val->is_array() || msgs_val->as_array().empty()) {
                 send_openai_error(client_fd, 400, "Bad Request", "Missing or empty 'messages' array");
-                close(client_fd);
-                continue;
+                return;
             }
             messages.reserve(msgs_val->as_array().size());
             for (const auto& m : msgs_val->as_array()) {
@@ -804,10 +834,12 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             max_tokens = std::max(1, mt2->as_int());
         }
 
+        uint64_t req_id = req_counter.fetch_add(1) + 1;
+
         SamplingParams sampling;
         sampling.temperature = 0.0f;
         sampling.top_p = 1.0f;
-        sampling.seed = static_cast<uint64_t>(std::time(nullptr)) ^ (++req_counter * 2654435761ULL);
+        sampling.seed = static_cast<uint64_t>(std::time(nullptr)) ^ (req_id * 2654435761ULL);
         if (const auto* tv_val = root.get("temperature"); tv_val && tv_val->is_number()) {
             sampling.temperature = std::max(0.0f, tv_val->as_float());
         }
@@ -856,11 +888,28 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
 
         std::string rendered = InklingTokenizer::render_messages(messages, think_effort, tools_declare_json);
         std::vector<int32_t> prompt_ids = engine.tokenizer.encode(rendered);
+
+        // Compute leading system + tools prefix token count so the prefix cache can snapshot right after it!
+        int sys_prefix_len = 0;
+        {
+            std::vector<ChatMessage> sys_msgs;
+            for (const auto& m : messages) {
+                if (m.role == "system" || m.role == "developer") sys_msgs.push_back(m);
+                else break;
+            }
+            if (!sys_msgs.empty() || !tools_declare_json.empty()) {
+                std::string sys_rendered = InklingTokenizer::render_messages(sys_msgs, think_effort, tools_declare_json);
+                auto sys_ids = engine.tokenizer.encode(sys_rendered);
+                if (sys_ids.size() < prompt_ids.size() &&
+                    std::equal(sys_ids.begin(), sys_ids.end(), prompt_ids.begin())) {
+                    sys_prefix_len = static_cast<int>(sys_ids.size());
+                }
+            }
+        }
         if (static_cast<int>(prompt_ids.size()) + 1 >= cfg.max_seq) {
             send_openai_error(client_fd, 400, "Bad Request",
                               "Prompt exceeds max context length (" + std::to_string(cfg.max_seq) + ")");
-            close(client_fd);
-            continue;
+            return;
         }
         int clamped_max_tokens = std::min(max_tokens, cfg.max_seq - static_cast<int>(prompt_ids.size()) - 1);
 
@@ -868,11 +917,16 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         char id_buf[64];
         snprintf(id_buf, sizeof(id_buf), "%s-%lld-%llu",
                  is_responses ? "resp" : "chatcmpl",
-                 static_cast<long long>(created_ts), static_cast<unsigned long long>(req_counter));
+                 static_cast<long long>(created_ts), static_cast<unsigned long long>(req_id));
         std::string comp_id(id_buf);
-        std::string rs_item_id = "rs_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
-        std::string msg_item_id = "msg_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
-        std::string call_id_prefix = "call_" + std::to_string(created_ts) + "_" + std::to_string(req_counter);
+        std::string rs_item_id = "rs_" + std::to_string(created_ts) + "_" + std::to_string(req_id);
+        std::string msg_item_id = "msg_" + std::to_string(created_ts) + "_" + std::to_string(req_id);
+        std::string call_id_prefix = "call_" + std::to_string(created_ts) + "_" + std::to_string(req_id);
+
+        fprintf(stderr, "[req #%llu] %s stream=%d prompt=%zu tok (running...)\n",
+                static_cast<unsigned long long>(req_id), req.path.c_str(), stream ? 1 : 0, prompt_ids.size());
+
+        std::lock_guard<std::mutex> gpu_lock(gpu_mutex);
 
         // Speculative decoding is used when enabled and greedy (temperature == 0);
         // non-zero temperature automatically falls back to exact plain sampling.
@@ -1028,7 +1082,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                 close_resp_reasoning();
                 close_resp_message();
                 int fc_idx = resp_next_out_idx++;
-                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_counter) + "_" +
+                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_id) + "_" +
                                     std::to_string(idx);
                 std::string esc_name = json_escape(tc.name);
                 std::string esc_args = json_escape(tc.arguments_json);
@@ -1068,10 +1122,12 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         if (client_ok) {
             if (run_spec) {
                 out_ids = engine.generate_speculative(seq, prompt_ids, clamped_max_tokens,
-                                                      cfg.draft_depth, stats, false, on_token);
+                                                      cfg.draft_depth, stats, false, on_token,
+                                                      true, sys_prefix_len);
             } else {
                 out_ids = engine.generate_plain(seq, prompt_ids, clamped_max_tokens,
-                                                stats, false, sampling, on_token);
+                                                stats, false, sampling, on_token,
+                                                true, sys_prefix_len);
             }
         }
 
@@ -1106,7 +1162,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             for (size_t i = 0; i < parser.tool_calls.size(); ++i) {
                 const auto& tc = parser.tool_calls[i];
                 if (!first_item) out_arr << ",";
-                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_counter) + "_" +
+                std::string fc_id = "fc_" + std::to_string(created_ts) + "_" + std::to_string(req_id) + "_" +
                                     std::to_string(i);
                 out_arr << "{\"id\":\"" << fc_id
                         << "\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""
@@ -1120,7 +1176,7 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             usage_oss << "{\"input_tokens\":" << prompt_toks
                       << ",\"output_tokens\":" << comp_toks
                       << ",\"total_tokens\":" << (prompt_toks + comp_toks)
-                      << ",\"input_tokens_details\":{\"cached_tokens\":0}"
+                      << ",\"input_tokens_details\":{\"cached_tokens\":" << stats.cached_tokens << "}"
                       << ",\"output_tokens_details\":{\"reasoning_tokens\":0}}";
 
             bool completed = (hit_eos || parser.hit_stop || has_tools);
@@ -1145,7 +1201,8 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
                     std::ostringstream uoss;
                     uoss << "{\"prompt_tokens\":" << prompt_toks
                          << ",\"completion_tokens\":" << comp_toks
-                         << ",\"total_tokens\":" << (prompt_toks + comp_toks) << "}";
+                         << ",\"total_tokens\":" << (prompt_toks + comp_toks)
+                         << ",\"prompt_tokens_details\":{\"cached_tokens\":" << stats.cached_tokens << "}}";
                     std::ostringstream coss;
                     coss << "data: {\"id\":\"" << comp_id
                          << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created_ts
@@ -1183,22 +1240,42 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             body << "},\"logprobs\":null,\"finish_reason\":\"" << finish_reason << "\"}]"
                  << ",\"usage\":{\"prompt_tokens\":" << prompt_toks
                  << ",\"completion_tokens\":" << comp_toks
-                 << ",\"total_tokens\":" << (prompt_toks + comp_toks) << "}}";
+                 << ",\"total_tokens\":" << (prompt_toks + comp_toks)
+                 << ",\"prompt_tokens_details\":{\"cached_tokens\":" << stats.cached_tokens << "}}}";
             send_http_json(client_fd, 200, "OK", body.str());
         }
-
-        close(client_fd);
 
         int dec_toks = std::max(0, stats.gen_tokens - 1);
         double dec_tps = stats.decode_ms > 0.0 ? dec_toks / (stats.decode_ms / 1000.0) : 0.0;
         fprintf(stderr,
-                "[req #%llu] %s stream=%d spec=%d prompt=%d (%.0fms) gen=%d (%.1fms, %.2f tok/s) finish=%s\n",
-                static_cast<unsigned long long>(req_counter), req.path.c_str(), stream ? 1 : 0,
-                run_spec ? 1 : 0, prompt_toks, stats.prefill_ms, comp_toks, stats.decode_ms, dec_tps,
-                finish_reason);
+                "[req #%llu] %s stream=%d spec=%d prompt=%d (cached=%d, prefill=%.0fms) gen=%d (%.1fms, %.2f tok/s) finish=%s\n",
+                static_cast<unsigned long long>(req_id), req.path.c_str(), stream ? 1 : 0,
+                run_spec ? 1 : 0, prompt_toks, stats.cached_tokens, stats.prefill_ms, comp_toks,
+                stats.decode_ms, dec_tps, finish_reason);
+        } // @autoreleasepool
+    };
+
+    while (!g_stop_server.load()) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(server_fd, &rfds);
+        timeval tv{0, 250000}; // 250ms poll for clean SIGINT handling
+        int sel = select(server_fd + 1, &rfds, nullptr, nullptr, &tv);
+        if (sel <= 0) continue;
+
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        if (client_fd < 0) continue;
+
+        active_workers.fetch_add(1);
+        std::thread([&, client_fd]() { handle_client(client_fd); }).detach();
     }
 
     close(server_fd);
+    while (active_workers.load() > 0) {
+        usleep(10000);
+    }
     fprintf(stderr, "[server] Shutdown cleanly.\n");
     return 0;
 }

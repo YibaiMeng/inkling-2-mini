@@ -70,7 +70,8 @@ make format
 
 ### OpenAI-Compatible API (`--serve`)
 
-Supports `GET /health`, `GET /props`, `GET /v1/models` (exposing `context_length` / `max_model_len`, default **262,144** with dynamic grow-on-demand global KV caches; configurable via `--max-seq`), `POST /v1/chat/completions`, and `POST /v1/responses` (both non-streaming JSON and SSE streaming, `reasoning_content` / `reasoning` + `content` / `output_text`, **native Inkling 2 tool calling** via `tools` / `tool_calls` / `function_call` / `function_call_output`, multi-turn messages, `max_tokens`/`max_output_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`).
+- **Exact 2-Checkpoint Prefix Caching (`--serve`):** Automatically caches both the leading system+tools prefix (`sys_snap`) and last prefilled prompt (`prompt_snap`) plus live sequence tail, skipping repeated prompt prefill in multi-turn agent loops (~70–80× faster TTFT on warm turns) and reporting `cached_tokens` in OpenAI `usage`.
+- **OpenAI-Compatible API (`--serve`):** Multi-threaded HTTP/1.1 server (with `SO_RCVTIMEO`, `Transfer-Encoding: chunked`, and non-blocking `GET /health`, `GET /props`, `GET /v1/models`) supporting `POST /v1/chat/completions` and `POST /v1/responses` (sync & SSE streaming, `reasoning_content` / `reasoning` + `content` / `output_text`, native Inkling 2 tool calling via `tools` / `tool_calls` / `function_call` / `function_call_output`, `max_tokens`/`max_output_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`). Default context is **262,144** with dynamic grow-on-demand global KV caches (configurable via `--max-seq`).
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
