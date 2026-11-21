@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #include "engine.h"
+#include "http_server.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,12 +10,17 @@
 
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n"
+           "  --serve               Run OpenAI-compatible HTTP server (enables --spec by default)\n"
+           "  --host <addr>         Server bind address (default: 127.0.0.1)\n"
+           "  --port <port>         Server listen port (default: 8080)\n"
+           "  --model-name <name>   Model ID reported by /v1/models (default: inkling-2-mini)\n"
            "  --prompt <text>       User prompt (rendered with Inkling 2 chat template)\n"
            "  --raw-prompt <text>   Raw prompt string (no chat template)\n"
            "  --think <effort>      Thinking effort (0, 0.1, 0.2, 0.7, 0.9, 0.99; default: 0)\n"
            "  --max-tokens <N>      Max generated tokens (default: 128)\n"
            "  --batch <B>           Concurrent batch size 1..8 (default: 1)\n"
            "  --spec                Enable DSpark speculative decoding (B=1, greedy)\n"
+           "  --no-spec             Disable speculative decoding (e.g., with --serve)\n"
            "  --draft-depth <D>     Speculative draft depth: 0=adaptive (default), 1..7=fixed\n"
            "  --temp <T>            Sampling temperature (default: 0.0 greedy)\n"
            "  --top-p <P>           Nucleus sampling top-p (default: 1.0)\n"
@@ -39,19 +45,27 @@ int main(int argc, char** argv) {
     int max_tokens = 128;
     int batch_size = 1;
     bool use_spec = false;
+    bool spec_explicit = false;
     int draft_depth = 0; // adaptive by default
+    bool serve_mode = false;
+    ServerConfig srv_cfg;
     SamplingParams sampling;
     bool stream = false;
     bool dump_ids = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--prompt" && i + 1 < argc) { prompt = argv[++i]; raw_prompt = false; }
+        if (a == "--serve") { serve_mode = true; }
+        else if (a == "--host" && i + 1 < argc) { srv_cfg.host = argv[++i]; }
+        else if (a == "--port" && i + 1 < argc) { srv_cfg.port = atoi(argv[++i]); }
+        else if (a == "--model-name" && i + 1 < argc) { srv_cfg.model_name = argv[++i]; }
+        else if (a == "--prompt" && i + 1 < argc) { prompt = argv[++i]; raw_prompt = false; }
         else if (a == "--raw-prompt" && i + 1 < argc) { prompt = argv[++i]; raw_prompt = true; }
         else if (a == "--think" && i + 1 < argc) { think = argv[++i]; }
         else if (a == "--max-tokens" && i + 1 < argc) { max_tokens = atoi(argv[++i]); }
         else if (a == "--batch" && i + 1 < argc) { batch_size = atoi(argv[++i]); }
-        else if (a == "--spec") { use_spec = true; }
+        else if (a == "--spec") { use_spec = true; spec_explicit = true; }
+        else if (a == "--no-spec") { use_spec = false; spec_explicit = true; }
         else if (a == "--draft-depth" && i + 1 < argc) { draft_depth = atoi(argv[++i]); }
         else if (a == "--temp" && i + 1 < argc) { sampling.temperature = static_cast<float>(atof(argv[++i])); }
         else if (a == "--top-p" && i + 1 < argc) { sampling.top_p = static_cast<float>(atof(argv[++i])); }
@@ -64,7 +78,11 @@ int main(int argc, char** argv) {
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
     }
 
-    if (use_spec && sampling.temperature > 0.0f) {
+    if (serve_mode && !spec_explicit) {
+        use_spec = true; // Fast DSpark speculative mode by default when serving
+    }
+
+    if (!serve_mode && use_spec && sampling.temperature > 0.0f) {
         fprintf(stderr, "[warn] Speculative decoding uses exact greedy verification; ignoring --temp %.2f.\n",
                 sampling.temperature);
     }
@@ -73,6 +91,14 @@ int main(int argc, char** argv) {
     if (!engine.init(manifest, blobs, metal_path, use_spec, 4096)) {
         fprintf(stderr, "Engine initialization failed.\n");
         return 1;
+    }
+
+    if (serve_mode) {
+        srv_cfg.use_spec = use_spec;
+        srv_cfg.draft_depth = draft_depth;
+        srv_cfg.default_think = think;
+        srv_cfg.max_seq = 4096;
+        return run_openai_server(engine, srv_cfg);
     }
 
     std::string rendered = raw_prompt ? prompt : InklingTokenizer::render_prompt(prompt, think);

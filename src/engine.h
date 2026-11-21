@@ -3,6 +3,7 @@
 #include "model_weights.h"
 #include "tokenizer.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -101,13 +102,17 @@ public:
     // Propose `draft_len` (1..7) speculative tokens given anchor token ID
     std::vector<int32_t> draft_propose(SequenceState& seq, int32_t anchor_token, int draft_len = 7);
 
+    // Optional per-token streaming callback; return false to stop generation early.
+    using TokenCallback = std::function<bool(int32_t)>;
+
     // High-level generation helpers
     std::vector<int32_t> generate_plain(SequenceState& seq,
                                         const std::vector<int32_t>& prompt_ids,
                                         int max_new_tokens,
                                         GenStats& stats,
                                         bool stream_stdout = false,
-                                        const SamplingParams& sampling = {});
+                                        const SamplingParams& sampling = {},
+                                        const TokenCallback& on_token = nullptr);
 
     // draft_depth == 0 enables online adaptive speculative depth controller; 1..7 fixes depth.
     std::vector<int32_t> generate_speculative(SequenceState& seq,
@@ -115,7 +120,8 @@ public:
                                               int max_new_tokens,
                                               int draft_depth,
                                               GenStats& stats,
-                                              bool stream_stdout = false);
+                                              bool stream_stdout = false,
+                                              const TokenCallback& on_token = nullptr);
 
     // Multi-sequence parallel low-batch generation (B = 1..8)
     std::vector<std::vector<int32_t>> generate_batch(const std::vector<std::vector<int32_t>>& prompts,

@@ -1743,7 +1743,8 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
                                                    int max_new_tokens,
                                                    GenStats& stats,
                                                    bool stream_stdout,
-                                                   const SamplingParams& sampling) {
+                                                   const SamplingParams& sampling,
+                                                   const TokenCallback& on_token) {
     reset_sequence(seq);
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
@@ -1772,9 +1773,10 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
 
     generated.push_back(next_tok);
     if (stream_stdout) { printf("%s", tokenizer.decode_token(next_tok).c_str()); fflush(stdout); }
+    bool keep_going = (!on_token || on_token(next_tok));
 
     double td0 = now_ms();
-    for (int step = 1; step < max_new_tokens; ++step) {
+    for (int step = 1; keep_going && step < max_new_tokens; ++step) {
         if (next_tok == tokenizer.eos_id()) break;
         auto preds = forward_target_single(seq, {next_tok}, false, false, nullptr, LogitsMode::All);
         next_tok = (sampling.temperature > 0.0f)
@@ -1782,6 +1784,7 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
                        : preds[0];
         generated.push_back(next_tok);
         if (stream_stdout) { printf("%s", tokenizer.decode_token(next_tok).c_str()); fflush(stdout); }
+        if (on_token && !on_token(next_tok)) break;
     }
     double td1 = now_ms();
     stats.decode_ms = td1 - td0;
@@ -1794,7 +1797,8 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
                                                          int max_new_tokens,
                                                          int draft_depth,
                                                          GenStats& stats,
-                                                         bool stream_stdout) {
+                                                         bool stream_stdout,
+                                                         const TokenCallback& on_token) {
     reset_sequence(seq);
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
@@ -1851,9 +1855,10 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
     if (max_new_tokens <= 0) return generated;
     generated.push_back(cur_tok);
     if (stream_stdout) { printf("%s", tokenizer.decode_token(cur_tok).c_str()); fflush(stdout); }
+    bool keep_going = (!on_token || on_token(cur_tok));
 
     double td0 = now_ms();
-    while (static_cast<int>(generated.size()) < max_new_tokens && cur_tok != tokenizer.eos_id()) {
+    while (keep_going && static_cast<int>(generated.size()) < max_new_tokens && cur_tok != tokenizer.eos_id()) {
         int rem = max_new_tokens - static_cast<int>(generated.size());
         int d = (rem <= 1) ? 0 : choose_depth(rem);
         if (d == 0) {
@@ -1861,6 +1866,7 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
             cur_tok = preds[0];
             generated.push_back(cur_tok);
             if (stream_stdout) { printf("%s", tokenizer.decode_token(cur_tok).c_str()); fflush(stdout); }
+            if (on_token && !on_token(cur_tok)) break;
             plain_streak++;
             continue;
         }
@@ -1907,12 +1913,14 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
             if (static_cast<int>(generated.size()) < max_new_tokens) {
                 generated.push_back(drafts[i]);
                 if (stream_stdout) { printf("%s", tokenizer.decode_token(drafts[i]).c_str()); fflush(stdout); }
+                if (on_token && !on_token(drafts[i])) { hit_eos = true; break; }
                 if (drafts[i] == tokenizer.eos_id()) { hit_eos = true; break; }
             }
         }
         if (!hit_eos && static_cast<int>(generated.size()) < max_new_tokens) {
             generated.push_back(bonus_tok);
             if (stream_stdout) { printf("%s", tokenizer.decode_token(bonus_tok).c_str()); fflush(stdout); }
+            if (on_token && !on_token(bonus_tok)) hit_eos = true;
             if (bonus_tok == tokenizer.eos_id()) hit_eos = true;
         }
 

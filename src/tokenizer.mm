@@ -262,7 +262,57 @@ std::string InklingTokenizer::decode(const std::vector<int32_t>& ids) const {
 }
 
 std::string InklingTokenizer::render_prompt(const std::string& user_prompt, const std::string& think_effort) {
+    return render_messages({{"user", user_prompt, ""}}, think_effort);
+}
+
+std::string InklingTokenizer::render_messages(const std::vector<ChatMessage>& messages,
+                                              const std::string& think_effort) {
     // Matches ollama/model/renderers/inkling2.go Render()
-    return "<|message_system|><|content_text|>Thinking effort level: " + think_effort + "<|end_message|>"
-           "<|message_user|><|content_text|>" + user_prompt + "<|end_message|>";
+    std::string out;
+    bool effort_emitted = false;
+    auto write_effort = [&]() {
+        out += "<|message_system|><|content_text|>Thinking effort level: ";
+        out += think_effort;
+        out += "<|end_message|>";
+        effort_emitted = true;
+    };
+
+    for (const auto& msg : messages) {
+        std::string role_tag;
+        bool is_system = (msg.role == "system" || msg.role == "developer");
+        if (is_system) {
+            role_tag = "<|message_system|>";
+        } else if (msg.role == "user") {
+            role_tag = "<|message_user|>";
+        } else if (msg.role == "assistant") {
+            role_tag = "<|message_model|>";
+        } else if (msg.role == "tool") {
+            role_tag = "<|message_tool|>";
+        } else {
+            role_tag = "<|message_user|>";
+        }
+
+        if (!effort_emitted && !is_system) {
+            write_effort();
+        }
+        if (msg.role == "assistant" && !msg.reasoning_content.empty()) {
+            out += role_tag;
+            out += "<|content_thinking|>";
+            out += msg.reasoning_content;
+            out += "<|end_message|>";
+        }
+        if (!msg.content.empty() || !(msg.role == "assistant" && !msg.reasoning_content.empty())) {
+            out += role_tag;
+            out += "<|content_text|>";
+            out += msg.content;
+            out += "<|end_message|>";
+        }
+        if (msg.role == "assistant") {
+            out += "<|content_model_end_sampling|>";
+        }
+    }
+    if (!effort_emitted) {
+        write_effort();
+    }
+    return out;
 }

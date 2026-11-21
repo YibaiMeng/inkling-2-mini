@@ -5,8 +5,8 @@ LDFLAGS := -framework Metal -framework Foundation
 BUILD_DIR := build
 SRC_DIR := src
 
-SRCS := $(SRC_DIR)/tokenizer.mm $(SRC_DIR)/model_weights.mm $(SRC_DIR)/engine.mm $(SRC_DIR)/main.mm
-HDRS := $(SRC_DIR)/json_lite.h $(SRC_DIR)/tokenizer.h $(SRC_DIR)/model_weights.h $(SRC_DIR)/engine.h
+SRCS := $(SRC_DIR)/tokenizer.mm $(SRC_DIR)/model_weights.mm $(SRC_DIR)/engine.mm $(SRC_DIR)/http_server.mm $(SRC_DIR)/main.mm
+HDRS := $(SRC_DIR)/json_lite.h $(SRC_DIR)/tokenizer.h $(SRC_DIR)/model_weights.h $(SRC_DIR)/engine.h $(SRC_DIR)/http_server.h
 OBJS := $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/%.o,$(SRCS))
 
 .PHONY: all clean lint format

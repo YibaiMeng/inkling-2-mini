@@ -4,6 +4,12 @@
 #include <unordered_map>
 #include <vector>
 
+struct ChatMessage {
+    std::string role;
+    std::string content;
+    std::string reasoning_content;
+};
+
 class InklingTokenizer {
 public:
     bool load_from_json_file(const std::string& path);
@@ -12,11 +18,20 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const;
     std::string decode_token(int32_t id) const;
 
-    // Render standard Inkling 2 prompt for single user prompt
+    // Render standard Inkling 2 prompt for single user prompt or multi-turn messages
     static std::string render_prompt(const std::string& user_prompt, const std::string& think_effort = "0");
+    static std::string render_messages(const std::vector<ChatMessage>& messages,
+                                       const std::string& think_effort = "0");
 
     int32_t eos_id() const { return 200006; } // <|content_model_end_sampling|>
     int32_t end_message_id() const { return end_message_id_; }
+    bool is_special(int32_t id) const {
+        return id >= 0 && static_cast<size_t>(id) < is_special_id_.size() && is_special_id_[id];
+    }
+    int32_t token_id(const std::string& tok) const {
+        auto it = token_to_id_.find(tok);
+        return it == token_to_id_.end() ? -1 : it->second;
+    }
     size_t vocab_size() const { return id_to_token_.size(); }
 
 private:

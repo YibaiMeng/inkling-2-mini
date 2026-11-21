@@ -63,6 +63,24 @@ make format
 
 # Concurrent low-batch decode (B=1..8, shares all dense/MoE/unembed weight reads)
 ./build/inkling --batch 4 --max-tokens 128
+
+# OpenAI Chat Completions-compatible HTTP server (DSpark speculative on by default!)
+./build/inkling --serve --host 127.0.0.1 --port 8080
+```
+
+### OpenAI-Compatible API (`--serve`)
+
+Supports `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions` (both non-streaming JSON and Server-Sent Events `stream: true`, `reasoning_content` + `content` separation, multi-turn `messages`, `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`).
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inkling-2-mini",
+    "messages": [{"role": "user", "content": "Write an iterative Fibonacci function in Python."}],
+    "max_tokens": 256,
+    "stream": true
+  }'
 ```
 
 By default, weights are loaded directly from `~/.ollama/models/manifests/registry.ollama.ai/library/inkling-2-mini/26b-a5b-nvfp4` and `~/.ollama/models/blobs` (override with `--manifest` and `--blobs`).
