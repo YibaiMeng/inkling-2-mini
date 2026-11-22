@@ -599,14 +599,19 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
     std::atomic<uint64_t> req_counter{0};
     std::atomic<int> active_workers{0};
 
+    PrefixCacheStats init_cstats = engine.prefix_cache.get_stats();
     fprintf(stderr,
             "[server] OpenAI-compatible API listening on http://%s:%d\n"
-            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | POST /v1/responses | GET /health | GET /props\n"
-            "[server] Model: %s | Max context: %d | Speculative: %s (draft_depth=%s) | Default think: %s\n",
+            "[server] Endpoints: GET /v1/models | POST /v1/chat/completions | POST /v1/responses | GET /v1/cache | GET /health | GET /props\n"
+            "[server] Model: %s | Max context: %d | Speculative: %s (draft_depth=%s) | Default think: %s\n"
+            "[server] Prefix cache: RAM=%zu MB | NVMe offload=%zu MB (%s)\n",
             cfg.host.c_str(), cfg.port, cfg.model_name.c_str(), cfg.max_seq,
             cfg.use_spec ? "on" : "off",
             cfg.draft_depth <= 0 ? "auto" : std::to_string(cfg.draft_depth).c_str(),
-            cfg.default_think.c_str());
+            cfg.default_think.c_str(),
+            init_cstats.ram_budget_bytes / (1024u * 1024u),
+            init_cstats.disk_budget_bytes / (1024u * 1024u),
+            init_cstats.disk_budget_bytes > 0 ? init_cstats.offload_dir.c_str() : "disabled");
 
     auto handle_client = [&](int client_fd) {
         struct Guard {
@@ -638,8 +643,23 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         if ((req.method == "GET" || req.method == "HEAD") && req.path == "/health") {
             std::string body = "{\"status\":\"ok\",\"model\":\"" + json_escape(cfg.model_name) +
                                "\",\"context_length\":" + std::to_string(cfg.max_seq) +
-                               ",\"speculative\":" + (cfg.use_spec ? "true" : "false") + "}";
+                               ",\"speculative\":" + (cfg.use_spec ? "true" : "false") +
+                               ",\"prefix_cache\":" + engine.prefix_cache.stats_json() + "}";
             send_http_json(client_fd, 200, "OK", req.method == "HEAD" ? "" : body);
+            return;
+        }
+
+        if ((req.method == "GET" || req.method == "HEAD") && (req.path == "/v1/cache" || req.path == "/cache")) {
+            std::string body = engine.prefix_cache.stats_json();
+            send_http_json(client_fd, 200, "OK", req.method == "HEAD" ? "" : body);
+            return;
+        }
+
+        if (req.method == "DELETE" && (req.path == "/v1/cache" || req.path == "/cache")) {
+            std::lock_guard<std::mutex> gpu_lock(gpu_mutex);
+            engine.prefix_cache.clear();
+            engine.reset_sequence(seq);
+            send_http_json(client_fd, 200, "OK", "{\"cleared\":true,\"prefix_cache\":" + engine.prefix_cache.stats_json() + "}");
             return;
         }
 
@@ -823,6 +843,10 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         std::string req_model = cfg.model_name;
         if (const auto* mv = root.get("model"); mv && mv->is_string() && !mv->as_string().empty()) {
             req_model = mv->as_string();
+        }
+        std::string cache_key;
+        if (const auto* pck = root.get("prompt_cache_key"); pck && pck->is_string()) {
+            cache_key = pck->as_string();
         }
 
         int max_tokens = is_responses ? 1024 : 512;
@@ -1148,11 +1172,11 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
             if (run_spec) {
                 out_ids = engine.generate_speculative(seq, prompt_ids, clamped_max_tokens,
                                                       cfg.draft_depth, stats, false, on_token,
-                                                      true, sys_prefix_len, on_prefill);
+                                                      true, sys_prefix_len, on_prefill, cache_key);
             } else {
                 out_ids = engine.generate_plain(seq, prompt_ids, clamped_max_tokens,
                                                 stats, false, sampling, on_token,
-                                                true, sys_prefix_len, on_prefill);
+                                                true, sys_prefix_len, on_prefill, cache_key);
             }
         }
 
@@ -1273,9 +1297,10 @@ int run_openai_server(InklingEngine& engine, const ServerConfig& cfg) {
         int dec_toks = std::max(0, stats.gen_tokens - 1);
         double dec_tps = stats.decode_ms > 0.0 ? dec_toks / (stats.decode_ms / 1000.0) : 0.0;
         fprintf(stderr,
-                "[req #%llu] %s stream=%d spec=%d prompt=%d (cached=%d, prefill=%.0fms) gen=%d (%.1fms, %.2f tok/s) finish=%s\n",
+                "[req #%llu] %s stream=%d spec=%d prompt=%d (cached=%d [%s, %.1fms], prefill=%.0fms) gen=%d (%.1fms, %.2f tok/s) finish=%s\n",
                 static_cast<unsigned long long>(req_id), req.path.c_str(), stream ? 1 : 0,
-                run_spec ? 1 : 0, prompt_toks, stats.cached_tokens, stats.prefill_ms, comp_toks,
+                run_spec ? 1 : 0, prompt_toks, stats.cached_tokens, stats.cache_hit_source.c_str(),
+                stats.cache_restore_ms, stats.prefill_ms, comp_toks,
                 stats.decode_ms, dec_tps, finish_reason);
         } // @autoreleasepool
     };

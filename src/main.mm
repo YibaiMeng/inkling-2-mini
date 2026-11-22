@@ -19,6 +19,9 @@ static void print_usage(const char* prog) {
            "  --think <effort>      Thinking effort (0, 0.1, 0.2, 0.7, 0.9, 0.99; default: 0)\n"
            "  --max-tokens <N>      Max generated tokens (default: 128)\n"
            "  --max-seq <N>         Max context length (default: 262144; KV grows on demand)\n"
+           "  --cache-ram-mb <MB>   Prefix cache RAM budget in MB (default: 4096; 0=offload only)\n"
+           "  --cache-disk-mb <MB>  Prefix cache NVMe offload budget in MB (default: 16384; 0=off)\n"
+           "  --cache-dir <dir>     Base directory for NVMe KV offload (default: ~/.cache/inkling)\n"
            "  --batch <B>           Concurrent batch size 1..8 (default: 1)\n"
            "  --spec                Enable DSpark speculative decoding (B=1, greedy)\n"
            "  --no-spec             Disable speculative decoding (e.g., with --serve)\n"
@@ -66,6 +69,9 @@ int main(int argc, char** argv) {
         else if (a == "--think" && i + 1 < argc) { think = argv[++i]; }
         else if (a == "--max-tokens" && i + 1 < argc) { max_tokens = atoi(argv[++i]); }
         else if (a == "--max-seq" && i + 1 < argc) { max_seq = std::max(1024, atoi(argv[++i])); }
+        else if (a == "--cache-ram-mb" && i + 1 < argc) { srv_cfg.cache_ram_mb = static_cast<size_t>(strtoull(argv[++i], nullptr, 10)); }
+        else if (a == "--cache-disk-mb" && i + 1 < argc) { srv_cfg.cache_disk_mb = static_cast<size_t>(strtoull(argv[++i], nullptr, 10)); }
+        else if (a == "--cache-dir" && i + 1 < argc) { srv_cfg.cache_dir = argv[++i]; }
         else if (a == "--batch" && i + 1 < argc) { batch_size = atoi(argv[++i]); }
         else if (a == "--spec") { use_spec = true; spec_explicit = true; }
         else if (a == "--no-spec") { use_spec = false; spec_explicit = true; }
@@ -101,6 +107,11 @@ int main(int argc, char** argv) {
         srv_cfg.draft_depth = draft_depth;
         srv_cfg.default_think = think;
         srv_cfg.max_seq = max_seq;
+        PrefixCacheConfig pcfg;
+        pcfg.ram_budget_bytes = srv_cfg.cache_ram_mb * 1024ULL * 1024ULL;
+        pcfg.disk_budget_bytes = srv_cfg.cache_disk_mb * 1024ULL * 1024ULL;
+        pcfg.offload_base_dir = srv_cfg.cache_dir;
+        engine.prefix_cache.configure(pcfg);
         return run_openai_server(engine, srv_cfg);
     }
 

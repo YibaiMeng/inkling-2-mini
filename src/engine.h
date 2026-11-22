@@ -1,27 +1,12 @@
 #pragma once
 #import <Metal/Metal.h>
 #include "model_weights.h"
+#include "prefix_cache.h"
 #include "tokenizer.h"
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
-
-struct PrefixSnapshot {
-    int pos = 0;
-    bool has_draft = false;
-    std::vector<int32_t> tokens;
-    std::vector<std::vector<uint8_t>> local_k, local_v;
-    std::vector<std::vector<uint8_t>> conv_k, conv_v, conv_attn, conv_mlp;
-    std::vector<std::vector<uint8_t>> draft_local_k, draft_local_v;
-    std::vector<uint8_t> draft_last_feature;
-
-    void clear() {
-        pos = 0;
-        has_draft = false;
-        tokens.clear();
-    }
-};
 
 struct SequenceState {
     int pos = 0;
@@ -52,16 +37,16 @@ struct SequenceState {
     std::vector<uint16_t> pending_taps;
     int pending_count = 0;
 
-    // Exact prefix cache state (live token history + 2 lightweight local-ring/conv checkpoints)
+    // Exact live prefix tracking (multi-session & NVMe-offload checkpoints managed by InklingEngine::prefix_cache)
     bool live_has_draft = false;
     std::vector<int32_t> cached_tokens;
-    PrefixSnapshot sys_snap;    // End of system + tools prefix
-    PrefixSnapshot prompt_snap; // End of last prefilled prompt
 };
 
 struct GenStats {
     int prompt_tokens = 0;
     int cached_tokens = 0;
+    std::string cache_hit_source = "miss";
+    double cache_restore_ms = 0.0;
     int gen_tokens = 0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
@@ -91,6 +76,7 @@ public:
 
     InklingWeights weights;
     InklingTokenizer tokenizer;
+    PrefixCache prefix_cache;
 
     bool init(const std::string& manifest_path,
               const std::string& blobs_dir,
@@ -142,7 +128,8 @@ public:
                                         const TokenCallback& on_token = nullptr,
                                         bool reuse_prefix = false,
                                         int sys_prefix_len = 0,
-                                        const PrefillCallback& on_prefill = nullptr);
+                                        const PrefillCallback& on_prefill = nullptr,
+                                        const std::string& cache_key = "");
 
     // draft_depth == 0 enables online adaptive speculative depth controller; 1..7 fixes depth.
     std::vector<int32_t> generate_speculative(SequenceState& seq,
@@ -154,7 +141,8 @@ public:
                                               const TokenCallback& on_token = nullptr,
                                               bool reuse_prefix = false,
                                               int sys_prefix_len = 0,
-                                              const PrefillCallback& on_prefill = nullptr);
+                                              const PrefillCallback& on_prefill = nullptr,
+                                              const std::string& cache_key = "");
 
     // Multi-sequence parallel low-batch generation (B = 1..8)
     std::vector<std::vector<int32_t>> generate_batch(const std::vector<std::vector<int32_t>>& prompts,
@@ -324,11 +312,9 @@ private:
                               const SamplingParams& sampling,
                               uint64_t& rng_state) const;
 
-    void save_prefix_snapshot(const SequenceState& seq, PrefixSnapshot& snap, bool include_draft) const;
-    void restore_prefix_snapshot(SequenceState& seq, const PrefixSnapshot& snap) const;
-    int prepare_prefix_cache(SequenceState& seq,
-                             const std::vector<int32_t>& prompt_ids,
-                             bool need_draft);
+    PrefixRestoreResult prepare_prefix_cache(SequenceState& seq,
+                                             const std::vector<int32_t>& prompt_ids,
+                                             bool need_draft);
 
     void precompute_draft_folded();
 };

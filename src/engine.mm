@@ -417,8 +417,6 @@ void InklingEngine::reset_sequence(SequenceState& s) {
     s.pending_count = 0;
     s.live_has_draft = false;
     s.cached_tokens.clear();
-    s.sys_snap.clear();
-    s.prompt_snap.clear();
     for (size_t i = 0; i < s.conv_k.size(); ++i) {
         std::memset(s.conv_k[i].contents, 0, s.conv_k[i].length);
         std::memset(s.conv_v[i].contents, 0, s.conv_v[i].length);
@@ -427,128 +425,14 @@ void InklingEngine::reset_sequence(SequenceState& s) {
     }
 }
 
-void InklingEngine::save_prefix_snapshot(const SequenceState& seq,
-                                         PrefixSnapshot& snap,
-                                         bool include_draft) const {
-    const size_t nvisits = weights.plan.size();
-    snap.pos = seq.pos;
-    snap.has_draft = include_draft && weights.draft.loaded;
-    snap.tokens = seq.cached_tokens;
-
-    if (snap.conv_k.size() != nvisits) {
-        snap.local_k.resize(nvisits);
-        snap.local_v.resize(nvisits);
-        snap.conv_k.resize(nvisits);
-        snap.conv_v.resize(nvisits);
-        snap.conv_attn.resize(nvisits);
-        snap.conv_mlp.resize(nvisits);
-    }
-    auto copy_buf = [](id<MTLBuffer> buf, std::vector<uint8_t>& dst) {
-        size_t len = buf.length;
-        if (dst.size() != len) dst.resize(len);
-        std::memcpy(dst.data(), buf.contents, len);
-    };
-    for (size_t vi = 0; vi < nvisits; ++vi) {
-        if (weights.plan[vi].local) {
-            copy_buf(seq.k_cache[vi], snap.local_k[vi]);
-            copy_buf(seq.v_cache[vi], snap.local_v[vi]);
-        }
-        copy_buf(seq.conv_k[vi], snap.conv_k[vi]);
-        copy_buf(seq.conv_v[vi], snap.conv_v[vi]);
-        copy_buf(seq.conv_attn[vi], snap.conv_attn[vi]);
-        copy_buf(seq.conv_mlp[vi], snap.conv_mlp[vi]);
-    }
-    if (snap.has_draft) {
-        size_t nl = static_cast<size_t>(weights.draft.num_layers);
-        if (snap.draft_local_k.size() != nl) {
-            snap.draft_local_k.resize(nl);
-            snap.draft_local_v.resize(nl);
-        }
-        for (size_t li = 0; li < nl; ++li) {
-            if (weights.draft.layers[li].is_local) {
-                copy_buf(seq.draft_k_cache[li], snap.draft_local_k[li]);
-                copy_buf(seq.draft_v_cache[li], snap.draft_local_v[li]);
-            }
-        }
-        copy_buf(seq.draft_last_feature, snap.draft_last_feature);
-    }
-}
-
-void InklingEngine::restore_prefix_snapshot(SequenceState& seq, const PrefixSnapshot& snap) const {
-    const size_t nvisits = weights.plan.size();
-    auto load_buf = [](const std::vector<uint8_t>& src, id<MTLBuffer> buf) {
-        if (!src.empty()) std::memcpy(buf.contents, src.data(), src.size());
-    };
-    for (size_t vi = 0; vi < nvisits; ++vi) {
-        if (weights.plan[vi].local) {
-            load_buf(snap.local_k[vi], seq.k_cache[vi]);
-            load_buf(snap.local_v[vi], seq.v_cache[vi]);
-        }
-        load_buf(snap.conv_k[vi], seq.conv_k[vi]);
-        load_buf(snap.conv_v[vi], seq.conv_v[vi]);
-        load_buf(snap.conv_attn[vi], seq.conv_attn[vi]);
-        load_buf(snap.conv_mlp[vi], seq.conv_mlp[vi]);
-    }
-    if (snap.has_draft && weights.draft.loaded) {
-        for (int li = 0; li < weights.draft.num_layers; ++li) {
-            if (weights.draft.layers[li].is_local) {
-                load_buf(snap.draft_local_k[li], seq.draft_k_cache[li]);
-                load_buf(snap.draft_local_v[li], seq.draft_v_cache[li]);
-            }
-        }
-        load_buf(snap.draft_last_feature, seq.draft_last_feature);
-        seq.draft_ctx_pos = snap.pos;
-    } else {
-        seq.draft_ctx_pos = 0;
-    }
-    seq.pos = snap.pos;
-    seq.pending_taps.clear();
-    seq.pending_count = 0;
-    seq.live_has_draft = snap.has_draft;
-    seq.cached_tokens = snap.tokens;
-}
-
-int InklingEngine::prepare_prefix_cache(SequenceState& seq,
-                                        const std::vector<int32_t>& prompt_ids,
-                                        bool need_draft) {
-    const int plen = static_cast<int>(prompt_ids.size());
-    auto is_strict_prefix = [&](const std::vector<int32_t>& cand) -> bool {
-        if (cand.empty() || static_cast<int>(cand.size()) >= plen) return false;
-        return std::equal(cand.begin(), cand.end(), prompt_ids.begin());
-    };
-
-    // 1. Live end-of-sequence exact prefix hit (zero-copy!)
-    if (seq.pos > 0 && seq.pos == static_cast<int>(seq.cached_tokens.size()) &&
-        (!need_draft || seq.live_has_draft) && is_strict_prefix(seq.cached_tokens)) {
-        if (need_draft && seq.pending_count > 0) {
-            draft_flush_context(seq);
-        }
-        return seq.pos;
-    }
-
-    // 2. Pick longest matching checkpoint (prompt_snap vs sys_snap)
-    const PrefixSnapshot* best = nullptr;
-    auto consider = [&](const PrefixSnapshot& snap) {
-        if (snap.pos <= 0 || snap.pos != static_cast<int>(snap.tokens.size())) return;
-        if (need_draft && !snap.has_draft) return;
-        if (!is_strict_prefix(snap.tokens)) return;
-        if (!best || snap.pos > best->pos) best = &snap;
-    };
-    consider(seq.prompt_snap);
-    consider(seq.sys_snap);
-
-    if (best) {
-        int restored_pos = best->pos;
-        restore_prefix_snapshot(seq, *best);
-        // Any snapshot strictly beyond restored_pos will have its global KV overwritten
-        if (seq.prompt_snap.pos > restored_pos) seq.prompt_snap.clear();
-        if (seq.sys_snap.pos > restored_pos) seq.sys_snap.clear();
-        return restored_pos;
-    }
-
-    // 3. Cache miss: full reset
-    reset_sequence(seq);
-    return 0;
+PrefixRestoreResult InklingEngine::prepare_prefix_cache(SequenceState& seq,
+                                                        const std::vector<int32_t>& prompt_ids,
+                                                        bool need_draft) {
+    return prefix_cache.restore_best_prefix(
+        seq, weights, prompt_ids, need_draft,
+        [&](int needed) { return ensure_global_capacity(seq, needed); },
+        [&]() { draft_flush_context(seq); },
+        [&]() { reset_sequence(seq); });
 }
 
 void InklingEngine::encode_linear(id<MTLComputeCommandEncoder> enc,
@@ -1956,21 +1840,35 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
                                                    const TokenCallback& on_token,
                                                    bool reuse_prefix,
                                                    int sys_prefix_len,
-                                                   const PrefillCallback& on_prefill) {
+                                                   const PrefillCallback& on_prefill,
+                                                   const std::string& cache_key) {
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
     uint64_t rng = sampling.seed ? sampling.seed : 42ULL;
 
     double t0 = now_ms();
-    int cached = reuse_prefix ? prepare_prefix_cache(seq, prompt_ids, false) : (reset_sequence(seq), 0);
+    int cached = 0;
+    if (reuse_prefix && prefix_cache.enabled()) {
+        auto r = prepare_prefix_cache(seq, prompt_ids, false);
+        cached = r.cached_tokens;
+        stats.cache_hit_source = r.source;
+        stats.cache_restore_ms = r.restore_ms;
+    } else {
+        reset_sequence(seq);
+    }
     stats.cached_tokens = cached;
     seq.live_has_draft = false;
+
+    const bool do_cache = reuse_prefix && prefix_cache.enabled();
+    constexpr int kMilestoneStep = 4096;
+    int last_saved_pos = cached;
+    int next_milestone = ((cached / kMilestoneStep) + 1) * kMilestoneStep;
 
     int32_t next_tok = 0;
     size_t off = static_cast<size_t>(cached);
     while (off < prompt_ids.size()) {
         size_t len = std::min<size_t>(MAX_M, prompt_ids.size() - off);
-        if (reuse_prefix && sys_prefix_len > static_cast<int>(off) &&
+        if (do_cache && sys_prefix_len > static_cast<int>(off) &&
             sys_prefix_len < static_cast<int>(prompt_ids.size()) &&
             off + len > static_cast<size_t>(sys_prefix_len)) {
             len = static_cast<size_t>(sys_prefix_len) - off;
@@ -1980,21 +1878,32 @@ std::vector<int32_t> InklingEngine::generate_plain(SequenceState& seq,
         auto preds = forward_target_single(seq, chunk, false, false, nullptr,
                                            is_last ? LogitsMode::LastOnly : LogitsMode::None);
         off += len;
-        if (reuse_prefix && sys_prefix_len > 0 && static_cast<int>(off) == sys_prefix_len &&
-            seq.sys_snap.pos != sys_prefix_len) {
-            save_prefix_snapshot(seq, seq.sys_snap, false);
+        int cur_off = static_cast<int>(off);
+        if (do_cache && sys_prefix_len > 0 && cur_off == sys_prefix_len) {
+            prefix_cache.save_checkpoint(seq, weights, false, true, cache_key);
+            last_saved_pos = cur_off;
+        } else if (do_cache && !is_last && cur_off >= next_milestone) {
+            if (cur_off - last_saved_pos >= 2048 &&
+                cur_off + MAX_M < static_cast<int>(prompt_ids.size())) {
+                prefix_cache.save_checkpoint(seq, weights, false, false, cache_key);
+                last_saved_pos = cur_off;
+            }
+            next_milestone = ((cur_off / kMilestoneStep) + 1) * kMilestoneStep;
         }
         if (is_last) {
             next_tok = (sampling.temperature > 0.0f)
                            ? sample_logits_cpu(reinterpret_cast<const float*>(buf_logits_.contents), sampling, rng)
                            : preds[0];
-        } else if (on_prefill && !on_prefill(static_cast<int>(off), static_cast<int>(prompt_ids.size()))) {
+        } else if (on_prefill && !on_prefill(cur_off, static_cast<int>(prompt_ids.size()))) {
+            if (do_cache && cur_off - last_saved_pos >= 512) {
+                prefix_cache.save_checkpoint(seq, weights, false, false, cache_key);
+            }
             stats.prefill_ms = now_ms() - t0;
             return {};
         }
     }
-    if (reuse_prefix) {
-        save_prefix_snapshot(seq, seq.prompt_snap, false);
+    if (do_cache && static_cast<int>(prompt_ids.size()) > last_saved_pos) {
+        prefix_cache.save_checkpoint(seq, weights, false, false, cache_key);
     }
     double t1 = now_ms();
     stats.prefill_ms = t1 - t0;
@@ -2033,7 +1942,8 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
                                                          const TokenCallback& on_token,
                                                          bool reuse_prefix,
                                                          int sys_prefix_len,
-                                                         const PrefillCallback& on_prefill) {
+                                                         const PrefillCallback& on_prefill,
+                                                         const std::string& cache_key) {
     stats = {};
     stats.prompt_tokens = static_cast<int>(prompt_ids.size());
     const bool adaptive = (draft_depth <= 0);
@@ -2069,17 +1979,30 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
         return best_d;
     };
 
-    // Prefill with exact prefix cache reuse + tap capture (128-token AMX chunks + unembed ONLY last token!)
+    // Prefill with 2-tier RAM+NVMe prefix cache reuse + tap capture (512-token AMX chunks + unembed ONLY last token!)
     double t0 = now_ms();
-    int cached = reuse_prefix ? prepare_prefix_cache(seq, prompt_ids, true) : (reset_sequence(seq), 0);
+    int cached = 0;
+    if (reuse_prefix && prefix_cache.enabled()) {
+        auto r = prepare_prefix_cache(seq, prompt_ids, true);
+        cached = r.cached_tokens;
+        stats.cache_hit_source = r.source;
+        stats.cache_restore_ms = r.restore_ms;
+    } else {
+        reset_sequence(seq);
+    }
     stats.cached_tokens = cached;
     seq.live_has_draft = true;
+
+    const bool do_cache = reuse_prefix && prefix_cache.enabled();
+    constexpr int kMilestoneStep = 4096;
+    int last_saved_pos = cached;
+    int next_milestone = ((cached / kMilestoneStep) + 1) * kMilestoneStep;
 
     int32_t cur_tok = 0;
     size_t off = static_cast<size_t>(cached);
     while (off < prompt_ids.size()) {
         size_t len = std::min<size_t>(MAX_M, prompt_ids.size() - off);
-        if (reuse_prefix && sys_prefix_len > static_cast<int>(off) &&
+        if (do_cache && sys_prefix_len > static_cast<int>(off) &&
             sys_prefix_len < static_cast<int>(prompt_ids.size()) &&
             off + len > static_cast<size_t>(sys_prefix_len)) {
             len = static_cast<size_t>(sys_prefix_len) - off;
@@ -2089,25 +2012,37 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
         auto preds = forward_target_single(seq, chunk, true, false, nullptr,
                                            is_last ? LogitsMode::LastOnly : LogitsMode::None);
         off += len;
+        int cur_off = static_cast<int>(off);
         if (seq.pending_count >= 512) {
             draft_flush_context(seq);
         }
-        if (reuse_prefix && sys_prefix_len > 0 && static_cast<int>(off) == sys_prefix_len &&
-            (!seq.sys_snap.has_draft || seq.sys_snap.pos != sys_prefix_len)) {
+        if (do_cache && sys_prefix_len > 0 && cur_off == sys_prefix_len) {
             draft_flush_context(seq);
-            save_prefix_snapshot(seq, seq.sys_snap, true);
+            prefix_cache.save_checkpoint(seq, weights, true, true, cache_key);
+            last_saved_pos = cur_off;
+        } else if (do_cache && !is_last && cur_off >= next_milestone) {
+            if (cur_off - last_saved_pos >= 2048 &&
+                cur_off + MAX_M < static_cast<int>(prompt_ids.size())) {
+                draft_flush_context(seq);
+                prefix_cache.save_checkpoint(seq, weights, true, false, cache_key);
+                last_saved_pos = cur_off;
+            }
+            next_milestone = ((cur_off / kMilestoneStep) + 1) * kMilestoneStep;
         }
         if (is_last) {
             cur_tok = preds[0];
-        } else if (on_prefill && !on_prefill(static_cast<int>(off), static_cast<int>(prompt_ids.size()))) {
+        } else if (on_prefill && !on_prefill(cur_off, static_cast<int>(prompt_ids.size()))) {
             draft_flush_context(seq);
+            if (do_cache && cur_off - last_saved_pos >= 512) {
+                prefix_cache.save_checkpoint(seq, weights, true, false, cache_key);
+            }
             stats.prefill_ms = now_ms() - t0;
             return {};
         }
     }
     draft_flush_context(seq);
-    if (reuse_prefix) {
-        save_prefix_snapshot(seq, seq.prompt_snap, true);
+    if (do_cache && static_cast<int>(prompt_ids.size()) > last_saved_pos) {
+        prefix_cache.save_checkpoint(seq, weights, true, false, cache_key);
     }
     double t1 = now_ms();
     stats.prefill_ms = t1 - t0;
