@@ -15,6 +15,16 @@ inline float4 decode4_e2m1_scaled(uint w16) {
     return float4(as_type<half4>(fp16));
 }
 
+// Pure FP16 unscaled E2M1 decode (exact ±0, 0.5, 1, 1.5, 2, 3, 4, 6 in half4; no subnormals, fast-math safe!)
+inline half4 decode4_e2m1_unscaled_h(uint w16) {
+    ushort4 nibs = ushort4(w16 & 0xFu, (w16 >> 4) & 0xFu, (w16 >> 8) & 0xFu, (w16 >> 12) & 0xFu);
+    ushort4 mag = nibs & ushort4(7u);
+    ushort4 sgn = (nibs & ushort4(8u)) << 12;
+    ushort4 body = select(ushort4(0x3800u) + select(mag << 9, ushort4(0u), mag == ushort4(1u)),
+                          ushort4(0u), mag == ushort4(0u));
+    return as_type<half4>(sgn | body);
+}
+
 // Pure SIMD ALU FP8 E4M3FN decode (ZERO branches, scaled by 2^-8; fold * 256.0f into scale ONCE!)
 inline float4 decode4_fp8_scaled(uint w) {
     ushort4 b = ushort4(w & 0xFFu, (w >> 8) & 0xFFu, (w >> 16) & 0xFFu, (w >> 24) & 0xFFu);
@@ -533,7 +543,7 @@ kernel void linear_bf16_k64(
     }
 }
 
-// High-bandwidth tiled BF16 AMX GEMM for M > 8 (BM=32, BN=64, BK=32, bfloat4 loads, padded stride 36, 8KB smem!)
+// High-bandwidth tiled BF16 AMX GEMM for M > 8 (BM=32, BN=64, BK=32, M-inner grid swizzle for L2 W reuse!)
 kernel void linear_bf16_tiled(
     const device uchar* x_raw [[buffer(0)]],
     const device bfloat* w [[buffer(1)]],
@@ -544,8 +554,8 @@ kernel void linear_bf16_tiled(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg_pos [[threadgroup_position_in_grid]])
 {
-    uint bm = tg_pos.y * 32u;
-    uint bn = tg_pos.x * 64u;
+    uint bm = tg_pos.x * 32u;
+    uint bn = tg_pos.y * 64u;
     uint sg_m = (sg / 2u) * 16u;
     uint sg_n = (sg % 2u) * 32u;
 
@@ -562,64 +572,96 @@ kernel void linear_bf16_tiled(
     uint M = p.M, N = p.N, K = p.K;
     uint a_r = tid >> 3;        // 0..15
     uint a_c4 = (tid & 7u) * 4u; // 0,4,8..28
-    for (uint k0 = 0; k0 < K; k0 += 32u) {
-        // Load As[32][32] with vectorized bfloat4 (2 loads/thread)
-        for (uint r0 = 0; r0 < 32u; r0 += 16u) {
-            uint r = r0 + a_r;
-            uint gm = bm + r;
-            uint gk = k0 + a_c4;
-            bfloat4 v = bfloat4(bfloat(0.0f));
-            if (gm < M && gk + 3u < K) {
-                if (p.x_is_f32 == 0u) {
-                    v = ((const device bfloat4*)((const device bfloat*)x_raw + size_t(gm) * K + gk))[0];
-                } else {
-                    v = bfloat4(((const device float4*)((const device float*)x_raw + size_t(gm) * K + gk))[0]);
-                }
-            } else if (gm < M) {
-                for (uint q = 0; q < 4u; ++q) {
-                    if (gk + q < K) {
-                        v[q] = (p.x_is_f32 == 0u) ? ((const device bfloat*)x_raw)[size_t(gm) * K + gk + q]
-                                                  : bfloat(((const device float*)x_raw)[size_t(gm) * K + gk + q]);
+    bool full_tile = (bm + 32u <= M) && (bn + 64u <= N) && ((K & 31u) == 0u) && (p.x_is_f32 == 0u);
+    if (full_tile) {
+        const device bfloat* x_bf = (const device bfloat*)x_raw;
+        for (uint k0 = 0; k0 < K; k0 += 32u) {
+            ((threadgroup bfloat4*)(As + (0u + a_r) * 36u + a_c4))[0] =
+                ((const device bfloat4*)(x_bf + size_t(bm + 0u + a_r) * K + k0 + a_c4))[0];
+            ((threadgroup bfloat4*)(As + (16u + a_r) * 36u + a_c4))[0] =
+                ((const device bfloat4*)(x_bf + size_t(bm + 16u + a_r) * K + k0 + a_c4))[0];
+            for (uint r0 = 0; r0 < 64u; r0 += 16u) {
+                ((threadgroup bfloat4*)(Bs + (r0 + a_r) * 36u + a_c4))[0] =
+                    ((const device bfloat4*)(w + size_t(bn + r0 + a_r) * K + k0 + a_c4))[0];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint ks = 0; ks < 32u; ks += 8u) {
+                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
+                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
+                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
+                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
+                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
+                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
+                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        for (uint k0 = 0; k0 < K; k0 += 32u) {
+            for (uint r0 = 0; r0 < 32u; r0 += 16u) {
+                uint r = r0 + a_r;
+                uint gm = bm + r;
+                uint gk = k0 + a_c4;
+                bfloat4 v = bfloat4(bfloat(0.0f));
+                if (gm < M && gk + 3u < K) {
+                    if (p.x_is_f32 == 0u) {
+                        v = ((const device bfloat4*)((const device bfloat*)x_raw + size_t(gm) * K + gk))[0];
+                    } else {
+                        v = bfloat4(((const device float4*)((const device float*)x_raw + size_t(gm) * K + gk))[0]);
+                    }
+                } else if (gm < M) {
+                    for (uint q = 0; q < 4u; ++q) {
+                        if (gk + q < K) {
+                            v[q] = (p.x_is_f32 == 0u) ? ((const device bfloat*)x_raw)[size_t(gm) * K + gk + q]
+                                                      : bfloat(((const device float*)x_raw)[size_t(gm) * K + gk + q]);
+                        }
                     }
                 }
+                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = v;
             }
-            ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = v;
-        }
-        // Load Bs[64][32] with vectorized bfloat4 (4 loads/thread)
-        for (uint r0 = 0; r0 < 64u; r0 += 16u) {
-            uint r = r0 + a_r;
-            uint gn = bn + r;
-            uint gk = k0 + a_c4;
-            bfloat4 v = bfloat4(bfloat(0.0f));
-            if (gn < N && gk + 3u < K) {
-                v = ((const device bfloat4*)(w + size_t(gn) * K + gk))[0];
-            } else if (gn < N) {
-                for (uint q = 0; q < 4u; ++q) {
-                    if (gk + q < K) v[q] = w[size_t(gn) * K + gk + q];
+            for (uint r0 = 0; r0 < 64u; r0 += 16u) {
+                uint r = r0 + a_r;
+                uint gn = bn + r;
+                uint gk = k0 + a_c4;
+                bfloat4 v = bfloat4(bfloat(0.0f));
+                if (gn < N && gk + 3u < K) {
+                    v = ((const device bfloat4*)(w + size_t(gn) * K + gk))[0];
+                } else if (gn < N) {
+                    for (uint q = 0; q < 4u; ++q) {
+                        if (gk + q < K) v[q] = w[size_t(gn) * K + gk + q];
+                    }
                 }
+                ((threadgroup bfloat4*)(Bs + r * 36u + a_c4))[0] = v;
             }
-            ((threadgroup bfloat4*)(Bs + r * 36u + a_c4))[0] = v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint ks = 0; ks < 32u; ks += 8u) {
-            simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
-            simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
-            simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
-            simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
-            simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
-            simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
-            simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
-            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-            simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-            simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-            simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+            for (uint ks = 0; ks < 32u; ks += 8u) {
+                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
+                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
+                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
+                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
+                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
+                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
+                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
+                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Reuse smem_f32 as Cs[32][64]
@@ -637,6 +679,137 @@ kernel void linear_bf16_tiled(
             if (p.softcap > 0.0f) v = softcap_fn(v, p.softcap);
             if (p.out_f32 != 0u) ((device float*)y_raw)[size_t(gm) * N + gn] = v;
             else ((device bfloat*)y_raw)[size_t(gm) * N + gn] = bfloat(v);
+        }
+    }
+}
+
+// Peak-roofline BF16 AMX GEMM for M >= 64, N >= 128 (BM=64, BN=64, BK=32, 6.53 TFLOPS on M4 Pro!)
+// Grid: ((M + 63)/64, (N + 63)/64, 1) -> M-inner swizzle keeps B[bn..bn+63] resident in L2 across all M tiles!
+kernel void linear_bf16_tiled64(
+    const device uchar* x_raw [[buffer(0)]],
+    const device bfloat* w [[buffer(1)]],
+    const device bfloat* bias [[buffer(2)]],
+    device uchar* y_raw [[buffer(3)]],
+    constant LinearParams& p [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint2 tg_pos [[threadgroup_position_in_grid]])
+{
+    uint bm = tg_pos.x * 64u;
+    uint bn = tg_pos.y * 64u;
+    uint sg_m = (sg / 2u) * 32u;
+    uint sg_n = (sg % 2u) * 32u;
+
+    // 16 KB shared memory reused between (As[64][36] + Bs[64][36] = 9216 B) and Cs[64][64] (16384 B)
+    threadgroup float smem_f32[4096];
+    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;          // [64 * 36] = 2304 bfloats
+    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 2304; // [64 * 36] = 2304 bfloats
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4u; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint M = p.M, N = p.N, K = p.K;
+    uint a_r = tid >> 3;         // 0..15
+    uint a_c4 = (tid & 7u) * 4u; // 0,4..28
+    bool full_tile = (bm + 64u <= M) && (bn + 64u <= N) && ((K & 31u) == 0u) && (p.x_is_f32 == 0u);
+    if (full_tile) {
+        const device bfloat* x_bf = (const device bfloat*)x_raw;
+        for (uint k0 = 0; k0 < K; k0 += 32u) {
+            for (uint r0 = 0; r0 < 64u; r0 += 16u) {
+                uint r = r0 + a_r;
+                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] =
+                    ((const device bfloat4*)(x_bf + size_t(bm + r) * K + k0 + a_c4))[0];
+                ((threadgroup bfloat4*)(Bs + r * 36u + a_c4))[0] =
+                    ((const device bfloat4*)(w + size_t(bn + r) * K + k0 + a_c4))[0];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint ks = 0; ks < 32u; ks += 8u) {
+                simdgroup_bfloat8x8 a[4], b[4];
+                for (uint i = 0; i < 4u; ++i) simdgroup_load(a[i], As + (sg_m + i * 8u) * 36u + ks, 36);
+                for (uint j = 0; j < 4u; ++j) simdgroup_load(b[j], Bs + (sg_n + j * 8u) * 36u + ks, 36, ulong2(0), true);
+                for (uint i = 0; i < 4u; ++i)
+                    for (uint j = 0; j < 4u; ++j)
+                        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        for (uint k0 = 0; k0 < K; k0 += 32u) {
+            for (uint r0 = 0; r0 < 64u; r0 += 16u) {
+                uint r = r0 + a_r;
+                uint gm = bm + r;
+                uint gn = bn + r;
+                uint gk = k0 + a_c4;
+                bfloat4 av = bfloat4(bfloat(0.0f));
+                if (gm < M && gk + 3u < K) {
+                    if (p.x_is_f32 == 0u) {
+                        av = ((const device bfloat4*)((const device bfloat*)x_raw + size_t(gm) * K + gk))[0];
+                    } else {
+                        av = bfloat4(((const device float4*)((const device float*)x_raw + size_t(gm) * K + gk))[0]);
+                    }
+                } else if (gm < M) {
+                    for (uint q = 0; q < 4u; ++q) {
+                        if (gk + q < K) {
+                            av[q] = (p.x_is_f32 == 0u) ? ((const device bfloat*)x_raw)[size_t(gm) * K + gk + q]
+                                                       : bfloat(((const device float*)x_raw)[size_t(gm) * K + gk + q]);
+                        }
+                    }
+                }
+                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = av;
+
+                bfloat4 bv = bfloat4(bfloat(0.0f));
+                if (gn < N && gk + 3u < K) {
+                    bv = ((const device bfloat4*)(w + size_t(gn) * K + gk))[0];
+                } else if (gn < N) {
+                    for (uint q = 0; q < 4u; ++q) {
+                        if (gk + q < K) bv[q] = w[size_t(gn) * K + gk + q];
+                    }
+                }
+                ((threadgroup bfloat4*)(Bs + r * 36u + a_c4))[0] = bv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint ks = 0; ks < 32u; ks += 8u) {
+                simdgroup_bfloat8x8 a[4], b[4];
+                for (uint i = 0; i < 4u; ++i) simdgroup_load(a[i], As + (sg_m + i * 8u) * 36u + ks, 36);
+                for (uint j = 0; j < 4u; ++j) simdgroup_load(b[j], Bs + (sg_n + j * 8u) * 36u + ks, 36, ulong2(0), true);
+                for (uint i = 0; i < 4u; ++i)
+                    for (uint j = 0; j < 4u; ++j)
+                        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint i = 0; i < 4u; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Vectorized bfloat4 / float4 epilogue when aligned, else scalar tail
+    if (bm + 64u <= M && bn + 64u <= N && p.has_bias == 0u && p.softcap == 0.0f && (N & 3u) == 0u) {
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint r = idx >> 4;
+            uint c4 = (idx & 15u) * 4u;
+            float4 v = ((const threadgroup float4*)(smem_f32 + r * 64u + c4))[0];
+            if (p.out_f32 != 0u) {
+                ((device float4*)((device float*)y_raw + size_t(bm + r) * N + bn + c4))[0] = v;
+            } else {
+                ((device bfloat4*)((device bfloat*)y_raw + size_t(bm + r) * N + bn + c4))[0] = bfloat4(v);
+            }
+        }
+    } else {
+        for (uint idx = tid; idx < 4096u; idx += 128u) {
+            uint r = idx >> 6, c = idx & 63u;
+            uint gm = bm + r, gn = bn + c;
+            if (gm < M && gn < N) {
+                float v = smem_f32[idx];
+                if (p.has_bias != 0u) v += float(bias[gn]);
+                if (p.softcap > 0.0f) v = softcap_fn(v, p.softcap);
+                if (p.out_f32 != 0u) ((device float*)y_raw)[size_t(gm) * N + gn] = v;
+                else ((device bfloat*)y_raw)[size_t(gm) * N + gn] = bfloat(v);
+            }
         }
     }
 }
@@ -747,6 +920,100 @@ kernel void short_conv_rollback(
     conv_state[2u * C + c] = conv_win[(committed_len + 2u) * C + c];
 }
 
+// Parallel 2D FIR 4-tap ShortConv for prefill (M > 8, save_win == 0): saturates all 20 M4 Pro GPU cores!
+kernel void short_conv_4tap_prefill(
+    const device bfloat* x [[buffer(0)]],
+    const device bfloat* weight [[buffer(1)]],
+    const device bfloat* conv_state [[buffer(2)]],
+    device bfloat* out [[buffer(3)]],
+    constant ShortConvParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint c = gid.x, t = gid.y;
+    if (c >= p.C || t >= p.M) return;
+    float cur = float(x[size_t(t) * p.x_stride + p.x_offset + c]);
+    float s2 = (t >= 1u) ? float(x[size_t(t - 1u) * p.x_stride + p.x_offset + c]) : float(conv_state[2u * p.C + c]);
+    float s1 = (t >= 2u) ? float(x[size_t(t - 2u) * p.x_stride + p.x_offset + c]) : float(conv_state[(1u + t) * p.C + c]);
+    float s0 = (t >= 3u) ? float(x[size_t(t - 3u) * p.x_stride + p.x_offset + c]) : float(conv_state[t * p.C + c]);
+    float w0 = float(weight[0u * p.C + c]);
+    float w1 = float(weight[1u * p.C + c]);
+    float w2 = float(weight[2u * p.C + c]);
+    float w3 = float(weight[3u * p.C + c]);
+    float inv_scale = (p.is_dynamic != 0u) ? (1.0f / 3.0f) : rsqrt(5.0f);
+    float sum;
+    if (p.is_dynamic == 0u) {
+        sum = s0 * w0 + s1 * w1 + s2 * w2 + cur * w3 + cur;
+    } else {
+        uint head = c / 128u;
+        const device bfloat* dp = x + size_t(t) * p.dyn_stride + p.dyn_offset + head * 4u;
+        sum = cur * (w0 + float(dp[0])) + s2 * (w1 + float(dp[1])) +
+              s1 * (w2 + float(dp[2])) + s0 * (w3 + float(dp[3])) + cur;
+    }
+    out[size_t(t) * p.C + c] = bfloat(sum * inv_scale);
+}
+
+kernel void short_conv_4tap_add_f32_prefill(
+    const device bfloat* x [[buffer(0)]],
+    const device bfloat* weight [[buffer(1)]],
+    const device bfloat* conv_state [[buffer(2)]],
+    const device bfloat* residual_bf16 [[buffer(3)]],
+    device float* out_f32 [[buffer(4)]],
+    constant ShortConvParams& p [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint c = gid.x, t = gid.y;
+    if (c >= p.C || t >= p.M) return;
+    float cur = float(x[size_t(t) * p.C + c]);
+    float s2 = (t >= 1u) ? float(x[size_t(t - 1u) * p.C + c]) : float(conv_state[2u * p.C + c]);
+    float s1 = (t >= 2u) ? float(x[size_t(t - 2u) * p.C + c]) : float(conv_state[(1u + t) * p.C + c]);
+    float s0 = (t >= 3u) ? float(x[size_t(t - 3u) * p.C + c]) : float(conv_state[t * p.C + c]);
+    float w0 = float(weight[0u * p.C + c]);
+    float w1 = float(weight[1u * p.C + c]);
+    float w2 = float(weight[2u * p.C + c]);
+    float w3 = float(weight[3u * p.C + c]);
+    float conv_out = float(bfloat((s0 * w0 + s1 * w1 + s2 * w2 + cur * w3 + cur) * rsqrt(5.0f)));
+    out_f32[size_t(t) * p.C + c] = float(residual_bf16[size_t(t) * p.C + c]) + conv_out;
+}
+
+kernel void short_conv_4tap_add_bf16_prefill(
+    const device bfloat* x [[buffer(0)]],
+    const device bfloat* weight [[buffer(1)]],
+    const device bfloat* conv_state [[buffer(2)]],
+    const device uchar* partial_in [[buffer(3)]],
+    device bfloat* partial_out [[buffer(4)]],
+    constant ShortConvParams& p [[buffer(5)]], // is_dynamic reused as partial_is_f32!
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint c = gid.x, t = gid.y;
+    if (c >= p.C || t >= p.M) return;
+    float cur = float(x[size_t(t) * p.C + c]);
+    float s2 = (t >= 1u) ? float(x[size_t(t - 1u) * p.C + c]) : float(conv_state[2u * p.C + c]);
+    float s1 = (t >= 2u) ? float(x[size_t(t - 2u) * p.C + c]) : float(conv_state[(1u + t) * p.C + c]);
+    float s0 = (t >= 3u) ? float(x[size_t(t - 3u) * p.C + c]) : float(conv_state[t * p.C + c]);
+    float w0 = float(weight[0u * p.C + c]);
+    float w1 = float(weight[1u * p.C + c]);
+    float w2 = float(weight[2u * p.C + c]);
+    float w3 = float(weight[3u * p.C + c]);
+    float conv_out = float(bfloat((s0 * w0 + s1 * w1 + s2 * w2 + cur * w3 + cur) * rsqrt(5.0f)));
+    float prev = (p.is_dynamic != 0u)
+                     ? ((const device float*)partial_in)[size_t(t) * p.C + c]
+                     : float(((const device bfloat*)partial_in)[size_t(t) * p.C + c]);
+    partial_out[size_t(t) * p.C + c] = bfloat(prev + conv_out);
+}
+
+// Race-free 3-tap state commit after 2D parallel prefill FIR (requires M >= 3)
+kernel void short_conv_commit_state(
+    const device bfloat* x [[buffer(0)]],
+    device bfloat* conv_state [[buffer(1)]],
+    constant ShortConvParams& p [[buffer(2)]],
+    uint c [[thread_position_in_grid]])
+{
+    if (c >= p.C) return;
+    conv_state[0u * p.C + c] = x[size_t(p.M - 3u) * p.x_stride + p.x_offset + c];
+    conv_state[1u * p.C + c] = x[size_t(p.M - 2u) * p.x_stride + p.x_offset + c];
+    conv_state[2u * p.C + c] = x[size_t(p.M - 1u) * p.x_stride + p.x_offset + c];
+}
+
 // ============================================================================
 // 7. Attention Prep + Relative-Position FlashDecoding + Fused Output Gate
 // ============================================================================
@@ -824,6 +1091,86 @@ kernel void attn_rel_table(
     float acc = 0.0f;
     for (uint k = 0; k < 16u; ++k) acc = fma(float(rp[k]), float(rel_proj[k * 1024u + d]), acc);
     table[row * 1024u + d] = bfloat(acc);
+}
+
+// AMX Relative Position Table GEMM for prefill: table[R, 1024] = r_in[R, 16] @ rel_proj[16, 1024]
+// BM=32, BN=64, K=16 -> 1 barrier, 2 AMX steps, 10x faster than scalar attn_rel_table!
+// Grid: (16, (R + 31) / 32, 1), TG: (128, 1, 1)
+kernel void attn_rel_table_amx(
+    const device bfloat* r_in [[buffer(0)]],
+    const device bfloat* rel_proj [[buffer(1)]],
+    device bfloat* table [[buffer(2)]],
+    constant uint& total_rows [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]])
+{
+    uint bm = tg.y * 32u;
+    uint bn = tg.x * 64u;
+    uint sg_m = (sg / 2u) * 16u;
+    uint sg_n = (sg % 2u) * 32u;
+
+    // 8 KB shared mem reused between (As[32][20] + Bs[16][68] = 3456 B) and Cs[32][64] (8192 B)
+    threadgroup float smem_f32[2048];
+    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;          // [32 * 20] = 640 bfloats
+    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 640;  // [16 * 68] = 1088 bfloats
+
+    // Load As[32][16] (128 threads x 1 bfloat4 = 512 elems exact!)
+    uint a_r = tid >> 2;         // 0..31
+    uint a_c4 = (tid & 3u) * 4u; // 0, 4, 8, 12
+    uint gm = bm + a_r;
+    ((threadgroup bfloat4*)(As + a_r * 20u + a_c4))[0] =
+        (gm < total_rows) ? ((const device bfloat4*)(r_in + size_t(gm) * 16u + a_c4))[0]
+                          : bfloat4(bfloat(0.0f));
+
+    // Load Bs[16][64] (128 threads x 2 bfloat4 = 1024 elems exact!)
+    uint b_r0 = tid >> 4;          // 0..7
+    uint b_c4 = (tid & 15u) * 4u;  // 0, 4..60
+    ((threadgroup bfloat4*)(Bs + (b_r0 + 0u) * 68u + b_c4))[0] =
+        ((const device bfloat4*)(rel_proj + size_t(b_r0 + 0u) * 1024u + bn + b_c4))[0];
+    ((threadgroup bfloat4*)(Bs + (b_r0 + 8u) * 68u + b_c4))[0] =
+        ((const device bfloat4*)(rel_proj + size_t(b_r0 + 8u) * 1024u + bn + b_c4))[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 acc[2][4];
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint ks = 0u; ks < 16u; ks += 8u) {
+        simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
+        simdgroup_load(a0, As + (sg_m + 0u) * 20u + ks, 20);
+        simdgroup_load(a1, As + (sg_m + 8u) * 20u + ks, 20);
+        simdgroup_load(b0, Bs + ks * 68u + sg_n + 0u, 68);
+        simdgroup_load(b1, Bs + ks * 68u + sg_n + 8u, 68);
+        simdgroup_load(b2, Bs + ks * 68u + sg_n + 16u, 68);
+        simdgroup_load(b3, Bs + ks * 68u + sg_n + 24u, 68);
+        simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+        simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+        simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
+        simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
+        simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+        simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+        simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
+        simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = 0; i < 2u; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Vectorized bfloat4 writeout (512 bfloat4s / 128 threads = 4 stores/thread)
+    for (uint idx = tid; idx < 512u; idx += 128u) {
+        uint r = idx >> 4;
+        uint c4 = (idx & 15u) * 4u;
+        uint out_row = bm + r;
+        if (out_row < total_rows) {
+            float4 v = ((const threadgroup float4*)(smem_f32 + r * 64u + c4))[0];
+            ((device bfloat4*)(table + size_t(out_row) * 1024u + bn + c4))[0] = bfloat4(v);
+        }
+    }
 }
 
 struct RelAttnParams {
@@ -915,8 +1262,9 @@ kernel void rel_attn_merge_gate(
 }
 
 // ============================================================================
-// 7b. AMX FlashAttention-2 Prefill Kernel (BM=16, BN=32, D=128, 15.25 KB smem!)
+// 7b. AMX FlashAttention-2 Prefill Kernel (BM=16, BN=32, D=128, 15.25 KB smem -> 2 TGs/CU!)
 //     - 16x fewer K/V DRAM reads + Apple AMX simdgroup_bfloat8x8 for Q@K^T & P@V
+//     - Fast unmasked/no-bias interior path for long-context global attention (dist >= 1024)
 //     - Exact Inkling 2 relative position bias, virtual sink token, sliding window,
 //       causal mask, and fused sigmoid output gate (zero partial_out roundtrip!)
 //     - Grid: ((M + 15) / 16, 24, 1), TG: (128, 1, 1)
@@ -941,15 +1289,14 @@ kernel void rel_attn_prefill_amx(
     uint batch_q = min(16u, p.M - t0);
 
     // 15.25 KB shared memory (<= 16 KB -> 2 TGs/CU on M4 Pro!)
-    threadgroup bfloat Qs[16 * 128];   // 4096 B
+    threadgroup bfloat Qs[16 * 128];    // 4096 B
     threadgroup float kv_f32[16 * 128]; // 8192 B (aliased as KVs[32 * 128] bfloat & pv_f32[16 * 128] float!)
     threadgroup bfloat* KVs = (threadgroup bfloat*)kv_f32;
-    threadgroup float Ss[16 * 32];     // 2048 B
-    threadgroup bfloat Ps[16 * 32];    // 1024 B
+    threadgroup float Ss[16 * 32];      // 2048 B
+    threadgroup bfloat Ps[16 * 32];     // 1024 B
     threadgroup float row_peak[16], row_wsum[16], row_prior[16], row_sink[16]; // 256 B
 
-    // 1. Load Q[16, 128] (exact bfloat) + init online softmax state (virtual sink: peak=0, wsum=1)
-    uint c4 = (tid & 31u) * 4u; // 32 lanes cover all 128 head dims coalesced!
+    uint c4 = (tid & 31u) * 4u;
     for (uint pass = 0u; pass < 4u; ++pass) {
         uint r = pass * 4u + sg;
         bfloat4 qv = bfloat4(bfloat(0.0f));
@@ -969,41 +1316,40 @@ kernel void rel_attn_prefill_amx(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Per-thread output accumulator in registers: 128 threads -> 16 rows x 8 chunks of 16 elems
     uint out_r = tid >> 3;          // 0..15
     uint out_c0 = (tid & 7u) * 16u; // 0, 16, ..., 112
     float O_reg[16];
     for (uint k = 0u; k < 16u; ++k) O_reg[k] = 0.0f;
 
-    // Visible key range across this 16-token query tile
     uint first_q_pos = p.pos + t0;
     uint last_q_pos = p.pos + t0 + batch_q - 1u;
     uint max_end = last_q_pos + 1u;
     uint min_start = (p.window > 0u && (first_q_pos + 1u) > p.window) ? (first_q_pos + 1u - p.window) : 0u;
+    uint max_q_start = (p.window > 0u && (last_q_pos + 1u) > p.window) ? (last_q_pos + 1u - p.window) : 0u;
 
     const device bfloat* kh_base = k_cache + size_t(kv_head) * p.kv_capacity * 128u;
     const device bfloat* vh_base = v_cache + size_t(kv_head) * p.kv_capacity * 128u;
 
-    uint qk_sg_m = (sg / 2u) * 8u;   // 0 or 8
-    uint qk_sg_n = (sg % 2u) * 16u;  // 0 or 16
-    uint pv_sg_m = (sg / 2u) * 8u;   // 0 or 8
-    uint pv_sg_n = (sg % 2u) * 64u;  // 0 or 64
+    uint qk_sg_m = (sg / 2u) * 8u;
+    uint qk_sg_n = (sg % 2u) * 16u;
+    uint pv_sg_m = (sg / 2u) * 8u;
+    uint pv_sg_n = (sg % 2u) * 64u;
+    uint kv_r0 = tid >> 4;          // 0..7 (8 rows per 16-byte load pass!)
+    uint kv_c8 = (tid & 15u) * 8u;  // 0, 8, ..., 120 (8 bfloats = 16 bytes/thread)
 
     for (uint k_start = min_start; k_start < max_end; k_start += 32u) {
-        // 2. Load K[32, 128] into KVs (8 coalesced bfloat4 loads per thread)
-        for (uint pass = 0u; pass < 8u; ++pass) {
-            uint r = pass * 4u + sg;
+        for (uint pass = 0u; pass < 4u; ++pass) {
+            uint r = pass * 8u + kv_r0;
             uint k_pos = k_start + r;
-            bfloat4 kv = bfloat4(bfloat(0.0f));
+            uint4 kv = uint4(0u);
             if (k_pos < max_end) {
-                uint slot = (p.is_ring != 0u) ? (k_pos % p.kv_capacity) : k_pos;
-                kv = ((const device bfloat4*)(kh_base + size_t(slot) * 128u + c4))[0];
+                uint slot = (p.is_ring != 0u) ? ((p.kv_capacity == 2048u) ? (k_pos & 2047u) : (k_pos % p.kv_capacity)) : k_pos;
+                kv = ((const device uint4*)(kh_base + size_t(slot) * 128u + kv_c8))[0];
             }
-            ((threadgroup bfloat4*)(KVs + r * 128u + c4))[0] = kv;
+            ((threadgroup uint4*)(KVs + r * 128u + kv_c8))[0] = kv;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // 3. AMX S[16, 32] = Q[16, 128] @ K[32, 128]^T
         simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         for (uint d = 0u; d < 128u; d += 8u) {
@@ -1018,52 +1364,69 @@ kernel void rel_attn_prefill_amx(
         simdgroup_store(s1, Ss + qk_sg_m * 32u + (qk_sg_n + 8u), 32);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // 4. Online softmax over 16 rows (4 SGs x 4 rows each; 32 lanes = exact 32 K columns!)
-        //    AND load V[32, 128] into KVs right after softmax!
+        bool no_rel_bias = (batch_q == 16u) && (k_start >= max_q_start) &&
+                           (k_start + 31u + 1024u <= first_q_pos);
         uint k_pos_lane = k_start + lane;
-        for (uint rr = 0u; rr < 4u; ++rr) {
-            uint r = sg * 4u + rr;
-            float score = -INFINITY;
-            bool valid = false;
-            if (r < batch_q) {
-                uint q_pos = p.pos + t0 + r;
-                uint q_start = (p.window > 0u && (q_pos + 1u) > p.window) ? (q_pos + 1u - p.window) : 0u;
-                valid = (k_pos_lane >= q_start) && (k_pos_lane <= q_pos);
-                if (valid) {
-                    uint dist = q_pos - k_pos_lane;
-                    const device bfloat* tbl_row = table + size_t((t0 + r) * 24u + head) * 1024u;
-                    float bias = (dist < 1024u) ? float(tbl_row[dist]) : 0.0f;
-                    score = Ss[r * 32u + lane] * p.scale + (bias - row_sink[r]);
+        if (no_rel_bias) {
+            for (uint rr = 0u; rr < 4u; ++rr) {
+                uint r = sg * 4u + rr;
+                float score = Ss[r * 32u + lane] * p.scale - row_sink[r];
+                float tile_max = simd_max(score);
+                float prev_peak = row_peak[r];
+                float next_peak = max(prev_peak, tile_max);
+                float prior = fast::exp(prev_peak - next_peak);
+                float prob = fast::exp(score - next_peak);
+                float tile_sum = simd_sum(prob);
+                Ps[r * 32u + lane] = bfloat(prob);
+                if (lane == 0u) {
+                    row_peak[r] = next_peak;
+                    row_wsum[r] = fma(row_wsum[r], prior, tile_sum);
+                    row_prior[r] = prior;
                 }
             }
-            float tile_max = simd_max(score);
-            float prev_peak = row_peak[r];
-            float next_peak = max(prev_peak, tile_max);
-            float prior = fast::exp(prev_peak - next_peak);
-            float prob = valid ? fast::exp(score - next_peak) : 0.0f;
-            float tile_sum = simd_sum(prob);
-            Ps[r * 32u + lane] = bfloat(prob);
-            if (lane == 0u) {
-                row_peak[r] = next_peak;
-                row_wsum[r] = fma(row_wsum[r], prior, tile_sum);
-                row_prior[r] = prior;
+        } else {
+            for (uint rr = 0u; rr < 4u; ++rr) {
+                uint r = sg * 4u + rr;
+                float score = -INFINITY;
+                bool valid = false;
+                if (r < batch_q) {
+                    uint q_pos = p.pos + t0 + r;
+                    uint q_start = (p.window > 0u && (q_pos + 1u) > p.window) ? (q_pos + 1u - p.window) : 0u;
+                    valid = (k_pos_lane >= q_start) && (k_pos_lane <= q_pos);
+                    if (valid) {
+                        uint dist = q_pos - k_pos_lane;
+                        const device bfloat* tbl_row = table + size_t((t0 + r) * 24u + head) * 1024u;
+                        float bias = (dist < 1024u) ? float(tbl_row[dist]) : 0.0f;
+                        score = Ss[r * 32u + lane] * p.scale + (bias - row_sink[r]);
+                    }
+                }
+                float tile_max = simd_max(score);
+                float prev_peak = row_peak[r];
+                float next_peak = max(prev_peak, tile_max);
+                float prior = fast::exp(prev_peak - next_peak);
+                float prob = valid ? fast::exp(score - next_peak) : 0.0f;
+                float tile_sum = simd_sum(prob);
+                Ps[r * 32u + lane] = bfloat(prob);
+                if (lane == 0u) {
+                    row_peak[r] = next_peak;
+                    row_wsum[r] = fma(row_wsum[r], prior, tile_sum);
+                    row_prior[r] = prior;
+                }
             }
         }
 
-        // Load V[32, 128] into KVs (safe: step 3 finished reading K before the barrier above!)
-        for (uint pass = 0u; pass < 8u; ++pass) {
-            uint r = pass * 4u + sg;
+        for (uint pass = 0u; pass < 4u; ++pass) {
+            uint r = pass * 8u + kv_r0;
             uint k_pos = k_start + r;
-            bfloat4 vv = bfloat4(bfloat(0.0f));
+            uint4 vv = uint4(0u);
             if (k_pos < max_end) {
-                uint slot = (p.is_ring != 0u) ? (k_pos % p.kv_capacity) : k_pos;
-                vv = ((const device bfloat4*)(vh_base + size_t(slot) * 128u + c4))[0];
+                uint slot = (p.is_ring != 0u) ? ((p.kv_capacity == 2048u) ? (k_pos & 2047u) : (k_pos % p.kv_capacity)) : k_pos;
+                vv = ((const device uint4*)(vh_base + size_t(slot) * 128u + kv_c8))[0];
             }
-            ((threadgroup bfloat4*)(KVs + r * 128u + c4))[0] = vv;
+            ((threadgroup uint4*)(KVs + r * 128u + kv_c8))[0] = vv;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // 5. AMX PV[16, 128] = P[16, 32] @ V[32, 128]
         simdgroup_float8x8 pv[8];
         for (uint j = 0u; j < 8u; ++j) pv[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         for (uint ks = 0u; ks < 32u; ks += 8u) {
@@ -1077,7 +1440,6 @@ kernel void rel_attn_prefill_amx(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Reuse kv_f32[16 * 128] to rescale & accumulate into register O_reg[16]
         for (uint j = 0u; j < 8u; ++j) {
             simdgroup_store(pv[j], kv_f32 + pv_sg_m * 128u + pv_sg_n + j * 8u, 128);
         }
@@ -1091,7 +1453,6 @@ kernel void rel_attn_prefill_amx(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // 6. Normalize + Fused Sigmoid Output Gate -> out[M, 24, 128] BF16
     if (out_r < batch_q) {
         uint t = t0 + out_r;
         float inv_z = 1.0f / row_wsum[out_r];
@@ -1136,18 +1497,28 @@ kernel void add_bf16_bf16_to_bf16(
 { if (tid < n4) out[tid] = bfloat4(float4(a[tid]) + float4(b[tid])); }
 
 // ============================================================================
-// 9. Fast MoE Top-K + Unique Expert Bucketing (supports M = 1..512 for fast AMX prefill!)
-//    Grid: (1, 1, 1), TG: (128, 1, 1) — 21.5 KB shared mem!
+// 9. Fast MoE Top-K + Parallel Bucketing + 64-Token Worklist (M = 1..1024!)
 // ============================================================================
 struct IndirectDispatchArgs { uint x, y, z; };
+
+struct MoEWorkTile {
+    ushort u;
+    ushort base;
+    ushort batch;
+    ushort pad;
+};
 
 struct MoERouteTable {
     uint num_unique;
     uint unique_experts[128];
     uint expert_counts[128];
-    uint expert_tokens[128 * 512];
-    uint expert_slots[128 * 512];
-    float expert_weights[128 * 512];
+    uint expert_tokens[128 * 1024];
+    uint expert_slots[128 * 1024];
+    float expert_weights[128 * 1024];
+    uchar top_ids[1024 * 8];
+    float top_ws[1024 * 8];
+    uint num_work_tiles;
+    MoEWorkTile work_tiles[512];
 };
 
 struct RouterParams {
@@ -1156,6 +1527,129 @@ struct RouterParams {
     uint w2_grid_x;
     float route_scale;
 };
+
+// Parallel top-8 selection across all M tokens (for prefill M > 8): 1 thread per token!
+kernel void moe_topk_parallel(
+    const device float* router_logits [[buffer(0)]],
+    const device float* router_bias [[buffer(1)]],
+    device MoERouteTable* table [[buffer(2)]],
+    constant RouterParams& p [[buffer(3)]],
+    uint m [[thread_position_in_grid]])
+{
+    if (m >= p.M) return;
+    const device float* lp = router_logits + size_t(m) * 128u;
+    uint chosen_id[8];
+    float chosen_sel[8];
+    for (uint k = 0; k < 8u; ++k) { chosen_id[k] = 0u; chosen_sel[k] = -INFINITY; }
+    for (uint ex = 0; ex < 128u; ++ex) {
+        float s = sigmoid_fn(lp[ex]) + router_bias[ex];
+        if (s > chosen_sel[7]) {
+            uint pos = 7u;
+            while (pos > 0u && s > chosen_sel[pos - 1u]) {
+                chosen_sel[pos] = chosen_sel[pos - 1u];
+                chosen_id[pos] = chosen_id[pos - 1u];
+                pos--;
+            }
+            chosen_sel[pos] = s;
+            chosen_id[pos] = ex;
+        }
+    }
+    float lw[8];
+    float mx = -INFINITY;
+    for (uint k = 0; k < 8u; ++k) {
+        float lg = lp[chosen_id[k]];
+        float l = (lg >= 0.0f) ? -log(1.0f + exp(-lg)) : (lg - log(1.0f + exp(lg)));
+        lw[k] = l;
+        mx = max(mx, l);
+    }
+    float wsum = 0.0f;
+    for (uint k = 0; k < 8u; ++k) { lw[k] = exp(lw[k] - mx); wsum += lw[k]; }
+    float scale = p.route_scale / wsum;
+    for (uint k = 0; k < 8u; ++k) {
+        table->top_ids[m * 8u + k] = uchar(chosen_id[k]);
+        table->top_ws[m * 8u + k] = lw[k] * scale;
+    }
+}
+
+// Pass 1: 128-TG parallel expert bucketing (1 TG per expert e, 128 threads scan M tokens in <=8 steps!)
+// Writes directly to expert-indexed table->expert_tokens[e * 1024 + j] and table->expert_counts[e].
+kernel void moe_group_bucket_parallel(
+    device MoERouteTable* table [[buffer(0)]],
+    constant RouterParams& p [[buffer(1)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint e [[threadgroup_position_in_grid]])
+{
+    uint M = p.M;
+    ushort my_tok[8];
+    uchar my_slot[8];
+    uint my_cnt = 0u;
+    for (uint m = tid; m < M; m += 128u) {
+        uint base8 = m * 8u;
+        for (uint k = 0; k < 8u; ++k) {
+            if (uint(table->top_ids[base8 + k]) == e) {
+                my_tok[my_cnt] = ushort(m);
+                my_slot[my_cnt] = uchar(k);
+                my_cnt++;
+                break;
+            }
+        }
+    }
+    uint sg_off = simd_prefix_exclusive_sum(my_cnt);
+    uint sg_sum = simd_sum(my_cnt);
+    threadgroup uint sg_totals[4];
+    if (lane == 0u) sg_totals[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint base_off = 0u;
+    for (uint s = 0u; s < sg; ++s) base_off += sg_totals[s];
+    uint out_idx = base_off + sg_off;
+    uint e_base = e * 1024u;
+    for (uint i = 0u; i < my_cnt; ++i) {
+        uint m = uint(my_tok[i]);
+        uint k = uint(my_slot[i]);
+        table->expert_tokens[e_base + out_idx + i] = m;
+        table->expert_slots[e_base + out_idx + i] = k;
+        table->expert_weights[e_base + out_idx + i] = table->top_ws[m * 8u + k];
+    }
+    if (tid == 0u) {
+        table->expert_counts[e] = sg_totals[0] + sg_totals[1] + sg_totals[2] + sg_totals[3];
+    }
+}
+
+// Pass 2: 1-TG 64-token load-balanced worklist builder (splits hot experts >64 into balanced BM=64 tiles!)
+kernel void moe_build_worklist_64(
+    device MoERouteTable* table [[buffer(0)]],
+    device IndirectDispatchArgs* ind_w13 [[buffer(1)]],
+    device IndirectDispatchArgs* ind_w2 [[buffer(2)]],
+    constant RouterParams& p [[buffer(3)]],
+    uint e [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]])
+{
+    uint cnt = table->expert_counts[e];
+    uint nt = (cnt + 63u) >> 6;
+    uint sg_off = simd_prefix_exclusive_sum(nt);
+    uint sg_sum = simd_sum(nt);
+    threadgroup uint sg_totals[4];
+    if (lane == 0u) sg_totals[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint base_off = 0u;
+    for (uint s = 0u; s < sg; ++s) base_off += sg_totals[s];
+    uint tile_off = base_off + sg_off;
+    for (uint t = 0u; t < nt; ++t) {
+        uint b = t * 64u;
+        table->work_tiles[tile_off + t] = MoEWorkTile{ushort(e), ushort(b), ushort(min(64u, cnt - b)), 0u};
+    }
+    if (e == 0u) {
+        uint total_tiles = sg_totals[0] + sg_totals[1] + sg_totals[2] + sg_totals[3];
+        table->num_work_tiles = total_tiles;
+        ind_w13->x = p.w13_grid_x; ind_w13->y = total_tiles; ind_w13->z = 1u;
+        ind_w2->x  = p.w2_grid_x;  ind_w2->y  = total_tiles; ind_w2->z  = 1u;
+    }
+}
 
 kernel void moe_topk_and_group(
     const device float* router_logits [[buffer(0)]], // [M, 128] F32 from parallel linear
@@ -1166,13 +1660,13 @@ kernel void moe_topk_and_group(
     constant RouterParams& p [[buffer(5)]],
     uint e [[thread_index_in_threadgroup]])
 {
-    uint M = p.M; // 1..512
+    uint M = p.M; // 1..8 (decode/verify)
     threadgroup float tg_bias[128];
     tg_bias[e] = router_bias[e];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup uchar top_ids[512][8];
-    threadgroup float top_ws[512][8];
+    threadgroup uchar top_ids[16][8];
+    threadgroup float top_ws[16][8];
     for (uint m = e; m < M; m += 128u) {
         const device float* lp = router_logits + size_t(m) * 128u;
         uint chosen_id[8];
@@ -1234,9 +1728,9 @@ kernel void moe_topk_and_group(
         for (uint m = 0; m < M; ++m) {
             for (uint k = 0; k < 8u; ++k) {
                 if (uint(top_ids[m][k]) == e) {
-                    table->expert_tokens[u * 512u + j] = m;
-                    table->expert_slots[u * 512u + j] = k;
-                    table->expert_weights[u * 512u + j] = top_ws[m][k];
+                    table->expert_tokens[u * 1024u + j] = m;
+                    table->expert_slots[u * 1024u + j] = k;
+                    table->expert_weights[u * 1024u + j] = top_ws[m][k];
                     j++;
                 }
             }
@@ -1329,7 +1823,7 @@ struct MoEQuantParams {
     float outer_denom, gate_cap, up_cap;
 };
 
-// Dedicated M == 1 W13 NVFP4 kernel: ~16 registers, ZERO barriers, ZERO tg mem!
+// Dedicated M == 1 W13 NVFP4 kernel: 2 pairs/SG (grid_x=144), ZERO barriers, ZERO tg mem, 2x L1 act reuse!
 kernel void moe_w13_nvfp4_m1(
     const device half* act_h [[buffer(0)]],
     const device float* act_amax [[buffer(1)]],
@@ -1345,42 +1839,56 @@ kernel void moe_w13_nvfp4_m1(
 {
     uint u = tg.y;
     uint expert = table->unique_experts[u];
-    uint pair = tg.x * 4u + sg;
-    if (pair >= 1152u) return;
+    uint pair0 = (tg.x * 4u + sg) * 2u;
+    if (pair0 >= 1152u) return;
 
-    uint slot = table->expert_slots[u * 512u];
-    float rw = table->expert_weights[u * 512u];
+    uint slot = table->expert_slots[u * 1024u];
+    float rw = table->expert_weights[u * 1024u];
     float outer = act_amax[0] * w_amax[expert] * (16384.0f / (p.outer_denom * 1536.0f));
 
-    uint gr = pair * 2u;
-    const device uint2* gw = (const device uint2*)(w_packed + (size_t(expert) * 2304u + gr) * 288u);
-    const device uchar* gs = w_scales + (size_t(expert) * 2304u + gr) * 144u;
-    const device uint2* uw = gw + 144u;
-    const device uchar* us = gs + 144u;
+    uint gr = pair0 * 2u;
+    const device uint2* gw0 = (const device uint2*)(w_packed + (size_t(expert) * 2304u + gr) * 288u);
+    const device uchar* gs0 = w_scales + (size_t(expert) * 2304u + gr) * 144u;
+    const device uint2* uw0 = gw0 + 144u;
+    const device uchar* us0 = gs0 + 144u;
+    const device uint2* gw1 = gw0 + 288u;
+    const device uchar* gs1 = gs0 + 288u;
+    const device uint2* uw1 = gw0 + 432u;
+    const device uchar* us1 = gs0 + 432u;
     const device half4* xp = (const device half4*)act_h;
 
-    float gsum = 0.0f, usum = 0.0f;
+    float gsum0 = 0.0f, usum0 = 0.0f, gsum1 = 0.0f, usum1 = 0.0f;
     for (uint blk = lane; blk < 144u; blk += 32u) {
         float4 x0 = float4(xp[blk * 4u + 0u]);
         float4 x1 = float4(xp[blk * 4u + 1u]);
         float4 x2 = float4(xp[blk * 4u + 2u]);
         float4 x3 = float4(xp[blk * 4u + 3u]);
-        uint2 gww = gw[blk];
-        gsum = fma(dot(x0, decode4_e2m1_scaled(gww.x)) + dot(x1, decode4_e2m1_scaled(gww.x >> 16)) +
-                   dot(x2, decode4_e2m1_scaled(gww.y)) + dot(x3, decode4_e2m1_scaled(gww.y >> 16)),
-                   fp8_e4m3(gs[blk]), gsum);
-        uint2 uww = uw[blk];
-        usum = fma(dot(x0, decode4_e2m1_scaled(uww.x)) + dot(x1, decode4_e2m1_scaled(uww.x >> 16)) +
-                   dot(x2, decode4_e2m1_scaled(uww.y)) + dot(x3, decode4_e2m1_scaled(uww.y >> 16)),
-                   fp8_e4m3(us[blk]), usum);
+        uint2 w = gw0[blk];
+        gsum0 = fma(dot(x0, decode4_e2m1_scaled(w.x)) + dot(x1, decode4_e2m1_scaled(w.x >> 16)) +
+                    dot(x2, decode4_e2m1_scaled(w.y)) + dot(x3, decode4_e2m1_scaled(w.y >> 16)),
+                    fp8_e4m3(gs0[blk]), gsum0);
+        w = uw0[blk];
+        usum0 = fma(dot(x0, decode4_e2m1_scaled(w.x)) + dot(x1, decode4_e2m1_scaled(w.x >> 16)) +
+                    dot(x2, decode4_e2m1_scaled(w.y)) + dot(x3, decode4_e2m1_scaled(w.y >> 16)),
+                    fp8_e4m3(us0[blk]), usum0);
+        w = gw1[blk];
+        gsum1 = fma(dot(x0, decode4_e2m1_scaled(w.x)) + dot(x1, decode4_e2m1_scaled(w.x >> 16)) +
+                    dot(x2, decode4_e2m1_scaled(w.y)) + dot(x3, decode4_e2m1_scaled(w.y >> 16)),
+                    fp8_e4m3(gs1[blk]), gsum1);
+        w = uw1[blk];
+        usum1 = fma(dot(x0, decode4_e2m1_scaled(w.x)) + dot(x1, decode4_e2m1_scaled(w.x >> 16)) +
+                    dot(x2, decode4_e2m1_scaled(w.y)) + dot(x3, decode4_e2m1_scaled(w.y >> 16)),
+                    fp8_e4m3(us1[blk]), usum1);
     }
-    float gv = simd_sum(gsum) * outer;
-    float uv = simd_sum(usum) * outer;
+    float gv0 = simd_sum(gsum0) * outer;
+    float uv0 = simd_sum(usum0) * outer;
+    float gv1 = simd_sum(gsum1) * outer;
+    float uv1 = simd_sum(usum1) * outer;
     if (lane == 0u) {
-        gv = float(bfloat(gv));
-        uv = float(bfloat(uv));
-        float av = softcap_fn(gv, p.gate_cap) * sigmoid_fn(gv) * softcap_fn(uv, p.up_cap) * rw;
-        mid_out[slot * 1152u + pair] = bfloat(av);
+        gv0 = float(bfloat(gv0)); uv0 = float(bfloat(uv0));
+        mid_out[slot * 1152u + pair0]      = bfloat(softcap_fn(gv0, p.gate_cap) * sigmoid_fn(gv0) * softcap_fn(uv0, p.up_cap) * rw);
+        gv1 = float(bfloat(gv1)); uv1 = float(bfloat(uv1));
+        mid_out[slot * 1152u + pair0 + 1u] = bfloat(softcap_fn(gv1, p.gate_cap) * sigmoid_fn(gv1) * softcap_fn(uv1, p.up_cap) * rw);
     }
 }
 
@@ -1414,9 +1922,9 @@ kernel void moe_w13_nvfp4_coalesced(
     float inv_denom = 16384.0f / (p.outer_denom * 1536.0f);
 
     if (cnt == 1u) {
-        uint tok = table->expert_tokens[u * 512u];
-        uint slot = table->expert_slots[u * 512u];
-        float rw = table->expert_weights[u * 512u];
+        uint tok = table->expert_tokens[u * 1024u];
+        uint slot = table->expert_slots[u * 1024u];
+        float rw = table->expert_weights[u * 1024u];
         float outer = act_amax[tok] * wmax * inv_denom;
         const device half4* xp = (const device half4*)(act_h + size_t(tok) * 2304u);
         float gsum = 0.0f, usum = 0.0f;
@@ -1450,9 +1958,9 @@ kernel void moe_w13_nvfp4_coalesced(
         const device half4* xp[4];
         float gsum[4] = {0,0,0,0}, usum[4] = {0,0,0,0};
         for (uint j = 0; j < batch; ++j) {
-            toks[j] = table->expert_tokens[u * 512u + base + j];
-            slots[j] = table->expert_slots[u * 512u + base + j];
-            rw[j] = table->expert_weights[u * 512u + base + j];
+            toks[j] = table->expert_tokens[u * 1024u + base + j];
+            slots[j] = table->expert_slots[u * 1024u + base + j];
+            rw[j] = table->expert_weights[u * 1024u + base + j];
             outer[j] = act_amax[toks[j]] * wmax * inv_denom;
             xp[j] = (const device half4*)(act_h + size_t(toks[j]) * 2304u);
         }
@@ -1507,7 +2015,7 @@ kernel void moe_w2_nvfp4_coalesced(
     float inv_denom = 16384.0f / (p.outer_denom * 1536.0f);
 
     if (cnt == 1u) {
-        uint ri = table->expert_tokens[u * 512u] * 8u + table->expert_slots[u * 512u];
+        uint ri = table->expert_tokens[u * 1024u] * 8u + table->expert_slots[u * 1024u];
         float outer = mid_amax[ri] * wmax * inv_denom;
         const device half4* xp = (const device half4*)(mid_h + size_t(ri) * 1152u);
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -1533,8 +2041,8 @@ kernel void moe_w2_nvfp4_coalesced(
 
     for (uint base = 0u; base < cnt; base += 2u) {
         bool has1 = (base + 1u) < cnt;
-        uint ri0 = table->expert_tokens[u * 512u + base] * 8u + table->expert_slots[u * 512u + base];
-        uint ri1 = table->expert_tokens[u * 512u + min(base + 1u, cnt - 1u)] * 8u + table->expert_slots[u * 512u + min(base + 1u, cnt - 1u)];
+        uint ri0 = table->expert_tokens[u * 1024u + base] * 8u + table->expert_slots[u * 1024u + base];
+        uint ri1 = table->expert_tokens[u * 1024u + min(base + 1u, cnt - 1u)] * 8u + table->expert_slots[u * 1024u + min(base + 1u, cnt - 1u)];
         float out_sc0 = mid_amax[ri0] * wmax * inv_denom;
         float out_sc1 = mid_amax[ri1] * wmax * inv_denom;
         const device half4* xp0 = (const device half4*)(mid_h + size_t(ri0) * 1152u);
@@ -1563,7 +2071,7 @@ kernel void moe_w2_nvfp4_coalesced(
 }
 
 // ============================================================================
-// 12. HIGH-BANDWIDTH COALESCED MXFP8 MoE KERNELS (L20..23 — v3, SIMD ALU!)
+// 12. HIGH-BANDWIDTH COALESCED MXFP8 MoE KERNELS (L20..23 — v4: ZERO barriers, ZERO tg_act!)
 // ============================================================================
 kernel void moe_w13_mxfp8_coalesced(
     const device float* act [[buffer(0)]],
@@ -1572,7 +2080,6 @@ kernel void moe_w13_mxfp8_coalesced(
     const device MoERouteTable* table [[buffer(3)]],
     device bfloat* mid_out [[buffer(4)]],
     constant MoEQuantParams& p [[buffer(5)]],
-    uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
@@ -1589,28 +2096,22 @@ kernel void moe_w13_mxfp8_coalesced(
     const device uint2* uw = (const device uint2*)(w_packed + (size_t(expert) * 2304u + ur) * 576u);
     const device uchar* us = w_scales + (size_t(expert) * 2304u + ur) * 72u;
 
-    threadgroup float4 tg_act[4][64];
-
     if (cnt == 1u) {
-        uint tok = table->expert_tokens[u * 512u];
-        uint slot = table->expert_slots[u * 512u];
-        float rw = table->expert_weights[u * 512u];
+        uint tok = table->expert_tokens[u * 1024u];
+        uint slot = table->expert_slots[u * 1024u];
+        float rw = table->expert_weights[u * 1024u];
         const device float4* xp = (const device float4*)(act + size_t(tok) * 2304u);
         float gsum = 0.0f, usum = 0.0f;
-        for (uint blk0 = 0u; blk0 < 288u; blk0 += 32u) {
-            if (tid < 64u) tg_act[0][tid] = xp[blk0 * 2u + tid];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint blk = blk0 + lane;
+        for (uint blk = lane; blk < 288u; blk += 32u) {
             uint sb = blk >> 2;
-            float4 x0 = tg_act[0][lane * 2u + 0u];
-            float4 x1 = tg_act[0][lane * 2u + 1u];
+            float4 x0 = xp[blk * 2u + 0u];
+            float4 x1 = xp[blk * 2u + 1u];
             uint2 gww = gw[blk];
             gsum = fma(dot(x0, decode4_fp8_scaled(gww.x)) + dot(x1, decode4_fp8_scaled(gww.y)),
                        mxfp8_e8m0(gs[sb]) * 256.0f, gsum);
             uint2 uww = uw[blk];
             usum = fma(dot(x0, decode4_fp8_scaled(uww.x)) + dot(x1, decode4_fp8_scaled(uww.y)),
                        mxfp8_e8m0(us[sb]) * 256.0f, usum);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float gv = float(bfloat(simd_sum(gsum)));
         float uv = float(bfloat(simd_sum(usum)));
@@ -1624,31 +2125,26 @@ kernel void moe_w13_mxfp8_coalesced(
     for (uint base = 0u; base < cnt; base += 4u) {
         uint batch = min(4u, cnt - base);
         uint toks[4], slots[4];
+        const device float4* xp[4];
         float rw[4], gsum[4] = {0,0,0,0}, usum[4] = {0,0,0,0};
         for (uint j = 0; j < batch; ++j) {
-            toks[j] = table->expert_tokens[u * 512u + base + j];
-            slots[j] = table->expert_slots[u * 512u + base + j];
-            rw[j] = table->expert_weights[u * 512u + base + j];
+            toks[j] = table->expert_tokens[u * 1024u + base + j];
+            slots[j] = table->expert_slots[u * 1024u + base + j];
+            rw[j] = table->expert_weights[u * 1024u + base + j];
+            xp[j] = (const device float4*)(act + size_t(toks[j]) * 2304u);
         }
-        for (uint blk0 = 0u; blk0 < 288u; blk0 += 32u) {
-            for (uint idx = tid; idx < batch * 64u; idx += 128u) {
-                uint j = idx >> 6, c = idx & 63u;
-                tg_act[j][c] = ((const device float4*)(act + size_t(toks[j]) * 2304u))[blk0 * 2u + c];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint blk = blk0 + lane;
+        for (uint blk = lane; blk < 288u; blk += 32u) {
             uint sb = blk >> 2;
             uint2 gww = gw[blk]; float gsc = mxfp8_e8m0(gs[sb]) * 256.0f;
             float4 g0 = decode4_fp8_scaled(gww.x), g1 = decode4_fp8_scaled(gww.y);
-            for (uint j = 0; j < batch; ++j) {
-                gsum[j] = fma(dot(tg_act[j][lane * 2u], g0) + dot(tg_act[j][lane * 2u + 1u], g1), gsc, gsum[j]);
-            }
             uint2 uww = uw[blk]; float usc = mxfp8_e8m0(us[sb]) * 256.0f;
             float4 u0 = decode4_fp8_scaled(uww.x), u1 = decode4_fp8_scaled(uww.y);
             for (uint j = 0; j < batch; ++j) {
-                usum[j] = fma(dot(tg_act[j][lane * 2u], u0) + dot(tg_act[j][lane * 2u + 1u], u1), usc, usum[j]);
+                float4 x0 = xp[j][blk * 2u + 0u];
+                float4 x1 = xp[j][blk * 2u + 1u];
+                gsum[j] = fma(dot(x0, g0) + dot(x1, g1), gsc, gsum[j]);
+                usum[j] = fma(dot(x0, u0) + dot(x1, u1), usc, usum[j]);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         for (uint j = 0; j < batch; ++j) {
             float gv = float(bfloat(simd_sum(gsum[j])));
@@ -1667,7 +2163,6 @@ kernel void moe_w2_mxfp8_coalesced(
     const device uchar* w_scales [[buffer(2)]],
     const device MoERouteTable* table [[buffer(3)]],
     device float* down_out [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
@@ -1683,29 +2178,20 @@ kernel void moe_w2_mxfp8_coalesced(
     const device uint2* w1 = (const device uint2*)(w_packed + (size_t(expert) * 2304u + out0 + 1u) * 288u);
     const device uchar* s1 = w_scales + (size_t(expert) * 2304u + out0 + 1u) * 36u;
 
-    threadgroup float4 tg_act[4][64];
-
     if (cnt == 1u) {
-        uint ri = table->expert_tokens[u * 512u] * 8u + table->expert_slots[u * 512u];
+        uint ri = table->expert_tokens[u * 1024u] * 8u + table->expert_slots[u * 1024u];
         const device float4* xp = (const device float4*)(mid_act + size_t(ri) * 1152u);
         float a0 = 0.0f, a1 = 0.0f;
-        for (uint blk0 = 0u; blk0 < 144u; blk0 += 32u) {
-            uint blks_this = min(32u, 144u - blk0);
-            if (tid < blks_this * 2u) tg_act[0][tid] = xp[blk0 * 2u + tid];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane < blks_this) {
-                uint blk = blk0 + lane;
-                uint sb = blk >> 2;
-                float4 x0 = tg_act[0][lane * 2u + 0u];
-                float4 x1 = tg_act[0][lane * 2u + 1u];
-                uint2 ww0 = w0[blk];
-                a0 = fma(dot(x0, decode4_fp8_scaled(ww0.x)) + dot(x1, decode4_fp8_scaled(ww0.y)),
-                         mxfp8_e8m0(s0[sb]) * 256.0f, a0);
-                uint2 ww1 = w1[blk];
-                a1 = fma(dot(x0, decode4_fp8_scaled(ww1.x)) + dot(x1, decode4_fp8_scaled(ww1.y)),
-                         mxfp8_e8m0(s1[sb]) * 256.0f, a1);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint blk = lane; blk < 144u; blk += 32u) {
+            uint sb = blk >> 2;
+            float4 x0 = xp[blk * 2u + 0u];
+            float4 x1 = xp[blk * 2u + 1u];
+            uint2 ww0 = w0[blk];
+            a0 = fma(dot(x0, decode4_fp8_scaled(ww0.x)) + dot(x1, decode4_fp8_scaled(ww0.y)),
+                     mxfp8_e8m0(s0[sb]) * 256.0f, a0);
+            uint2 ww1 = w1[blk];
+            a1 = fma(dot(x0, decode4_fp8_scaled(ww1.x)) + dot(x1, decode4_fp8_scaled(ww1.y)),
+                     mxfp8_e8m0(s1[sb]) * 256.0f, a1);
         }
         float v0 = simd_sum(a0), v1 = simd_sum(a1);
         if (lane == 0u) {
@@ -1718,31 +2204,24 @@ kernel void moe_w2_mxfp8_coalesced(
     for (uint base = 0u; base < cnt; base += 4u) {
         uint batch = min(4u, cnt - base);
         uint ris[4];
+        const device float4* xp[4];
         float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
-        for (uint j = 0; j < batch; ++j)
-            ris[j] = table->expert_tokens[u * 512u + base + j] * 8u + table->expert_slots[u * 512u + base + j];
-        for (uint blk0 = 0u; blk0 < 144u; blk0 += 32u) {
-            uint blks_this = min(32u, 144u - blk0);
-            uint n4 = blks_this * 2u;
+        for (uint j = 0; j < batch; ++j) {
+            ris[j] = table->expert_tokens[u * 1024u + base + j] * 8u + table->expert_slots[u * 1024u + base + j];
+            xp[j] = (const device float4*)(mid_act + size_t(ris[j]) * 1152u);
+        }
+        for (uint blk = lane; blk < 144u; blk += 32u) {
+            uint sb = blk >> 2;
+            uint2 ww0 = w0[blk]; float sc0 = mxfp8_e8m0(s0[sb]) * 256.0f;
+            float4 r0 = decode4_fp8_scaled(ww0.x), r1 = decode4_fp8_scaled(ww0.y);
+            uint2 ww1 = w1[blk]; float sc1 = mxfp8_e8m0(s1[sb]) * 256.0f;
+            float4 q0 = decode4_fp8_scaled(ww1.x), q1 = decode4_fp8_scaled(ww1.y);
             for (uint j = 0; j < batch; ++j) {
-                if (tid < n4) tg_act[j][tid] = ((const device float4*)(mid_act + size_t(ris[j]) * 1152u))[blk0 * 2u + tid];
+                float4 x0 = xp[j][blk * 2u + 0u];
+                float4 x1 = xp[j][blk * 2u + 1u];
+                a0[j] = fma(dot(x0, r0) + dot(x1, r1), sc0, a0[j]);
+                a1[j] = fma(dot(x0, q0) + dot(x1, q1), sc1, a1[j]);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane < blks_this) {
-                uint blk = blk0 + lane;
-                uint sb = blk >> 2;
-                uint2 ww0 = w0[blk]; float sc0 = mxfp8_e8m0(s0[sb]) * 256.0f;
-                float4 r0 = decode4_fp8_scaled(ww0.x), r1 = decode4_fp8_scaled(ww0.y);
-                for (uint j = 0; j < batch; ++j) {
-                    a0[j] = fma(dot(tg_act[j][lane * 2u], r0) + dot(tg_act[j][lane * 2u + 1u], r1), sc0, a0[j]);
-                }
-                uint2 ww1 = w1[blk]; float sc1 = mxfp8_e8m0(s1[sb]) * 256.0f;
-                float4 q0 = decode4_fp8_scaled(ww1.x), q1 = decode4_fp8_scaled(ww1.y);
-                for (uint j = 0; j < batch; ++j) {
-                    a1[j] = fma(dot(tg_act[j][lane * 2u], q0) + dot(tg_act[j][lane * 2u + 1u], q1), sc1, a1[j]);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         for (uint j = 0; j < batch; ++j) {
             float v0 = simd_sum(a0[j]), v1 = simd_sum(a1[j]);
@@ -1755,12 +2234,154 @@ kernel void moe_w2_mxfp8_coalesced(
 }
 
 // ============================================================================
-// 12b. HIGH-THROUGHPUT AMX PREFILL MoE KERNELS (BM=32, BN=64, BK=32, simdgroup_bfloat8x8!)
-//      - 8.0 KB shared memory (high CU occupancy!), 2x2 simdgroup layout (16x32 per SG, 8 FMAs/6 loads)
-//      - 1 NVFP4/MXFP8 block per thread (exact 128-thread symmetry), 1 pass for cnt <= 32!
-//      - Both NVFP4 (E2M1*E4M3) & MXFP8 (E4M3*E8M0) fit 100% bit-exactly in bfloat16!
-//      - Grid: (36, num_unique, 1), TG: (128, 1, 1) -> half the act bandwidth of BN=32!
+// 12b. HIGH-THROUGHPUT AMX PREFILL MoE KERNELS (4-Bucket Branch-Free BM=16/32/48/64, BN=64, BK=32!)
+//      - Template-instantiated branch-free inner k0 loops -> peak ~5.8-6.2 TFLOPS!
+//      - 1 single weight sweep for cnt <= 64, AND <= 15 rows padding for every expert!
+//      - NVFP4: direct simdgroup_half8x8 (bit-exact E2M1*E4M3 <= 2688, zero half->bf16 cast!)
+//      - MXFP8: simdgroup_bfloat8x8 (preserves full E8M0 dynamic range)
+//      - Grid: (36, num_unique, 1), TG: (128, 1, 1)
 // ============================================================================
+template<uint TPASSES, uint K_DIM>
+inline void moe_nvfp4_amx_tile(
+    const device half* act_h,
+    const device uint2* w_row,
+    const device uchar* s_row,
+    const device MoERouteTable* table,
+    uint u, uint base, uint batch, bool is_w2,
+    threadgroup float* smem_f32,
+    uint tid, uint sg)
+{
+    constexpr uint TM = TPASSES; // 1 (BM=16), 2 (BM=32), 3 (BM=48), 4 (BM=64) -> sg owns TM*8 rows!
+    uint sg_m = (sg / 2u) * (TM * 8u);
+    uint sg_n = (sg % 2u) * 32u;
+    uint a_r = tid >> 3;         // 0..15
+    uint a_c4 = (tid & 7u) * 4u; // 0,4..28
+    uint b_r = tid >> 1;         // 0..63
+    uint b_blk = tid & 1u;       // 0..1
+
+    threadgroup half* As = (threadgroup half*)smem_f32;
+    threadgroup half* Bs = ((threadgroup half*)smem_f32) + 2304;
+
+    const device half4* xps[TPASSES];
+    for (uint pp = 0u; pp < TPASSES; ++pp) {
+        uint r = pp * 16u + a_r;
+        uint row_idx = 0u;
+        if (r < batch) {
+            uint tok = table->expert_tokens[u * 1024u + base + r];
+            row_idx = is_w2 ? (tok * 8u + table->expert_slots[u * 1024u + base + r]) : tok;
+        }
+        xps[pp] = (const device half4*)(act_h + size_t(row_idx) * K_DIM);
+    }
+
+    simdgroup_float8x8 acc[TM][4];
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        uint k4 = (k0 + a_c4) >> 2;
+        for (uint pp = 0u; pp < TPASSES; ++pp) {
+            uint r = pp * 16u + a_r;
+            ((threadgroup half4*)(As + r * 36u + a_c4))[0] =
+                (r < batch) ? xps[pp][k4] : half4(0.0h);
+        }
+        uint blk = (k0 >> 4) + b_blk;
+        uint2 qw = w_row[blk];
+        half sc = half(fp8_e4m3(s_row[blk]));
+        threadgroup half4* bp = (threadgroup half4*)(Bs + b_r * 36u + b_blk * 16u);
+        bp[0] = decode4_e2m1_unscaled_h(qw.x) * sc;
+        bp[1] = decode4_e2m1_unscaled_h(qw.x >> 16) * sc;
+        bp[2] = decode4_e2m1_unscaled_h(qw.y) * sc;
+        bp[3] = decode4_e2m1_unscaled_h(qw.y >> 16) * sc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ks = 0u; ks < 32u; ks += 8u) {
+            simdgroup_half8x8 a[TM], b[4];
+            for (uint i = 0; i < TM; ++i) simdgroup_load(a[i], As + (sg_m + i * 8u) * 36u + ks, 36);
+            for (uint j = 0; j < 4u; ++j) simdgroup_load(b[j], Bs + (sg_n + j * 8u) * 36u + ks, 36, ulong2(0), true);
+            for (uint i = 0; i < TM; ++i)
+                for (uint j = 0; j < 4u; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
+}
+
+template<uint TPASSES, uint K_DIM>
+inline void moe_mxfp8_amx_tile(
+    const device float* act,
+    const device uint4* w_row,
+    const device uchar* s_row,
+    const device MoERouteTable* table,
+    uint u, uint base, uint batch, bool is_w2,
+    threadgroup float* smem_f32,
+    uint tid, uint sg)
+{
+    constexpr uint TM = TPASSES;
+    uint sg_m = (sg / 2u) * (TM * 8u);
+    uint sg_n = (sg % 2u) * 32u;
+    uint a_r = tid >> 3;
+    uint a_c4 = (tid & 7u) * 4u;
+    uint b_r = tid >> 1;
+    uint b_blk = tid & 1u;
+
+    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;
+    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 2304;
+
+    const device float4* xps[TPASSES];
+    for (uint pp = 0u; pp < TPASSES; ++pp) {
+        uint r = pp * 16u + a_r;
+        uint row_idx = 0u;
+        if (r < batch) {
+            uint tok = table->expert_tokens[u * 1024u + base + r];
+            row_idx = is_w2 ? (tok * 8u + table->expert_slots[u * 1024u + base + r]) : tok;
+        }
+        xps[pp] = (const device float4*)(act + size_t(row_idx) * K_DIM);
+    }
+
+    simdgroup_float8x8 acc[TM][4];
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        uint k4 = (k0 + a_c4) >> 2;
+        for (uint pp = 0u; pp < TPASSES; ++pp) {
+            uint r = pp * 16u + a_r;
+            ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] =
+                (r < batch) ? bfloat4(xps[pp][k4]) : bfloat4(bfloat(0.0f));
+        }
+        uint qidx = (k0 >> 4) + b_blk;
+        uint sb = k0 >> 5;
+        uint4 qw = w_row[qidx];
+        float sc = mxfp8_e8m0(s_row[sb]) * 256.0f;
+        threadgroup bfloat4* bp = (threadgroup bfloat4*)(Bs + b_r * 36u + b_blk * 16u);
+        bp[0] = bfloat4(decode4_fp8_scaled(qw.x) * sc);
+        bp[1] = bfloat4(decode4_fp8_scaled(qw.y) * sc);
+        bp[2] = bfloat4(decode4_fp8_scaled(qw.z) * sc);
+        bp[3] = bfloat4(decode4_fp8_scaled(qw.w) * sc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ks = 0u; ks < 32u; ks += 8u) {
+            simdgroup_bfloat8x8 a[TM], b[4];
+            for (uint i = 0; i < TM; ++i) simdgroup_load(a[i], As + (sg_m + i * 8u) * 36u + ks, 36);
+            for (uint j = 0; j < 4u; ++j) simdgroup_load(b[j], Bs + (sg_n + j * 8u) * 36u + ks, 36, ulong2(0), true);
+            for (uint i = 0; i < TM; ++i)
+                for (uint j = 0; j < 4u; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < 4u; ++j)
+            simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
+}
+
 kernel void moe_w13_nvfp4_prefill(
     const device half* act_h [[buffer(0)]],
     const device float* act_amax [[buffer(1)]],
@@ -1774,100 +2395,39 @@ kernel void moe_w13_nvfp4_prefill(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
 {
-    uint u = tg.y;
-    uint expert = table->unique_experts[u];
-    uint cnt = table->expert_counts[u];
+    MoEWorkTile wt = table->work_tiles[tg.y];
+    uint expert = uint(wt.u);
+    uint base = uint(wt.base);
+    uint batch = uint(wt.batch);
     uint bn = tg.x * 64u;
-    if (bn >= 2304u) return;
+    if (bn >= 2304u || batch == 0u) return;
 
-    uint sg_m = (sg / 2u) * 16u;  // 0 or 16
-    uint sg_n = (sg % 2u) * 32u;  // 0 or 32
     float wmax = w_amax[expert];
-    float inv_denom = 16384.0f / (p.outer_denom * 1536.0f);
+    float inv_denom = 1.0f / (p.outer_denom * 1536.0f);
+    threadgroup float smem_f32[4096];
 
-    // 8.0 KB shared memory: As[32][36] (2304 B) + Bs[64][36] (4608 B) = 6912 B, reused as Cs[32][64] (8192 B)
-    threadgroup float smem_f32[2048];
-    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;
-    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 1152;
-
-    uint a_r = tid >> 3;          // 0..15 (16 rows/pass x 2 passes = 32 rows)
-    uint a_c4 = (tid & 7u) * 4u;  // 0,4..28 (8 threads load 32 contiguous elems/row)
-    uint b_r = tid >> 1;          // 0..63 (64 rows)
-    uint b_blk = tid & 1u;        // 0..1 (2 NVFP4 blocks = 32 elems/row)
-
+    uint b_r = tid >> 1;
     const device uint2* w_row = (const device uint2*)(w_packed + (size_t(expert) * 2304u + bn + b_r) * 288u);
     const device uchar* s_row = w_scales + (size_t(expert) * 2304u + bn + b_r) * 144u;
+    uint pair_base = tg.x * 32u;
 
-    for (uint base = 0u; base < cnt; base += 32u) {
-        uint batch = min(32u, cnt - base);
-        const device half4* xps[2];
-        for (uint p2 = 0u; p2 < 2u; ++p2) {
-            uint r = p2 * 16u + a_r;
-            uint tok = (r < batch) ? table->expert_tokens[u * 512u + base + r] : 0u;
-            xps[p2] = (const device half4*)(act_h + size_t(tok) * 2304u);
-        }
+    if (batch <= 16u)      moe_nvfp4_amx_tile<1u, 2304u>(act_h, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else if (batch <= 32u) moe_nvfp4_amx_tile<2u, 2304u>(act_h, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else if (batch <= 48u) moe_nvfp4_amx_tile<3u, 2304u>(act_h, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else                   moe_nvfp4_amx_tile<4u, 2304u>(act_h, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 acc[2][4];
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-        for (uint k0 = 0u; k0 < 2304u; k0 += 32u) {
-            for (uint p2 = 0u; p2 < 2u; ++p2) {
-                uint r = p2 * 16u + a_r;
-                bfloat4 av = (r < batch) ? bfloat4(float4(xps[p2][(k0 + a_c4) >> 2])) : bfloat4(bfloat(0.0f));
-                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = av;
-            }
-            uint blk = (k0 >> 4) + b_blk;
-            uint2 qw = w_row[blk];
-            float sc = fp8_e4m3(s_row[blk]);
-            threadgroup bfloat4* bp = (threadgroup bfloat4*)(Bs + b_r * 36u + b_blk * 16u);
-            bp[0] = bfloat4(decode4_e2m1_scaled(qw.x) * sc);
-            bp[1] = bfloat4(decode4_e2m1_scaled(qw.x >> 16) * sc);
-            bp[2] = bfloat4(decode4_e2m1_scaled(qw.y) * sc);
-            bp[3] = bfloat4(decode4_e2m1_scaled(qw.y >> 16) * sc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint ks = 0u; ks < 32u; ks += 8u) {
-                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
-                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
-                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
-                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Reuse smem_f32 as Cs[32][64]
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint pair_base = tg.x * 32u;
-        for (uint idx = tid; idx < batch * 32u; idx += 128u) {
-            uint j = idx >> 5;
-            uint pl = idx & 31u;
-            uint tok = table->expert_tokens[u * 512u + base + j];
-            uint slot = table->expert_slots[u * 512u + base + j];
-            float rw = table->expert_weights[u * 512u + base + j];
-            float outer = act_amax[tok] * wmax * inv_denom;
-            float gv = float(bfloat(smem_f32[j * 64u + pl * 2u] * outer));
-            float uv = float(bfloat(smem_f32[j * 64u + pl * 2u + 1u] * outer));
-            float av = softcap_fn(gv, p.gate_cap) * sigmoid_fn(gv) * softcap_fn(uv, p.up_cap) * rw;
-            mid_out[(tok * 8u + slot) * 1152u + pair_base + pl] = bfloat(av);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < batch * 32u; idx += 128u) {
+        uint j = idx >> 5;
+        uint pl = idx & 31u;
+        uint tok = table->expert_tokens[expert * 1024u + base + j];
+        uint slot = table->expert_slots[expert * 1024u + base + j];
+        float rw = table->expert_weights[expert * 1024u + base + j];
+        float outer = act_amax[tok] * wmax * inv_denom;
+        float gv = float(bfloat(smem_f32[j * 64u + pl * 2u] * outer));
+        float uv = float(bfloat(smem_f32[j * 64u + pl * 2u + 1u] * outer));
+        float av = softcap_fn(gv, p.gate_cap) * sigmoid_fn(gv) * softcap_fn(uv, p.up_cap) * rw;
+        mid_out[(tok * 8u + slot) * 1152u + pair_base + pl] = bfloat(av);
     }
 }
 
@@ -1884,96 +2444,34 @@ kernel void moe_w2_nvfp4_prefill(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
 {
-    uint u = tg.y;
-    uint expert = table->unique_experts[u];
-    uint cnt = table->expert_counts[u];
+    MoEWorkTile wt = table->work_tiles[tg.y];
+    uint expert = uint(wt.u);
+    uint base = uint(wt.base);
+    uint batch = uint(wt.batch);
     uint bn = tg.x * 64u;
-    if (bn >= 2304u) return;
+    if (bn >= 2304u || batch == 0u) return;
 
-    uint sg_m = (sg / 2u) * 16u;
-    uint sg_n = (sg % 2u) * 32u;
     float wmax = w_amax[expert];
-    float inv_denom = 16384.0f / (p.outer_denom * 1536.0f);
+    float inv_denom = 1.0f / (p.outer_denom * 1536.0f);
+    threadgroup float smem_f32[4096];
 
-    threadgroup float smem_f32[2048];
-    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;
-    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 1152;
-
-    uint a_r = tid >> 3;
-    uint a_c4 = (tid & 7u) * 4u;
     uint b_r = tid >> 1;
-    uint b_blk = tid & 1u;
-
     const device uint2* w_row = (const device uint2*)(w_packed + (size_t(expert) * 2304u + bn + b_r) * 144u);
     const device uchar* s_row = w_scales + (size_t(expert) * 2304u + bn + b_r) * 72u;
 
-    for (uint base = 0u; base < cnt; base += 32u) {
-        uint batch = min(32u, cnt - base);
-        const device half4* xps[2];
-        for (uint p2 = 0u; p2 < 2u; ++p2) {
-            uint r = p2 * 16u + a_r;
-            uint ri = (r < batch)
-                          ? (table->expert_tokens[u * 512u + base + r] * 8u +
-                             table->expert_slots[u * 512u + base + r])
-                          : 0u;
-            xps[p2] = (const device half4*)(mid_h + size_t(ri) * 1152u);
-        }
+    if (batch <= 16u)      moe_nvfp4_amx_tile<1u, 1152u>(mid_h, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else if (batch <= 32u) moe_nvfp4_amx_tile<2u, 1152u>(mid_h, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else if (batch <= 48u) moe_nvfp4_amx_tile<3u, 1152u>(mid_h, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else                   moe_nvfp4_amx_tile<4u, 1152u>(mid_h, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 acc[2][4];
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-        for (uint k0 = 0u; k0 < 1152u; k0 += 32u) {
-            for (uint p2 = 0u; p2 < 2u; ++p2) {
-                uint r = p2 * 16u + a_r;
-                bfloat4 av = (r < batch) ? bfloat4(float4(xps[p2][(k0 + a_c4) >> 2])) : bfloat4(bfloat(0.0f));
-                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = av;
-            }
-            uint blk = (k0 >> 4) + b_blk;
-            uint2 qw = w_row[blk];
-            float sc = fp8_e4m3(s_row[blk]);
-            threadgroup bfloat4* bp = (threadgroup bfloat4*)(Bs + b_r * 36u + b_blk * 16u);
-            bp[0] = bfloat4(decode4_e2m1_scaled(qw.x) * sc);
-            bp[1] = bfloat4(decode4_e2m1_scaled(qw.x >> 16) * sc);
-            bp[2] = bfloat4(decode4_e2m1_scaled(qw.y) * sc);
-            bp[3] = bfloat4(decode4_e2m1_scaled(qw.y >> 16) * sc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint ks = 0u; ks < 32u; ks += 8u) {
-                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
-                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
-                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
-                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint idx = tid; idx < batch * 64u; idx += 128u) {
-            uint j = idx >> 6;
-            uint cl = idx & 63u;
-            uint ri = table->expert_tokens[u * 512u + base + j] * 8u +
-                      table->expert_slots[u * 512u + base + j];
-            float outer = mid_amax[ri] * wmax * inv_denom;
-            down_out[size_t(ri) * 2304u + bn + cl] = float(bfloat(smem_f32[j * 64u + cl] * outer));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < batch * 64u; idx += 128u) {
+        uint j = idx >> 6;
+        uint cl = idx & 63u;
+        uint ri = table->expert_tokens[expert * 1024u + base + j] * 8u +
+                  table->expert_slots[expert * 1024u + base + j];
+        float outer = mid_amax[ri] * wmax * inv_denom;
+        down_out[size_t(ri) * 2304u + bn + cl] = float(bfloat(smem_f32[j * 64u + cl] * outer));
     }
 }
 
@@ -1988,96 +2486,35 @@ kernel void moe_w13_mxfp8_prefill(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
 {
-    uint u = tg.y;
-    uint expert = table->unique_experts[u];
-    uint cnt = table->expert_counts[u];
+    MoEWorkTile wt = table->work_tiles[tg.y];
+    uint expert = uint(wt.u);
+    uint base = uint(wt.base);
+    uint batch = uint(wt.batch);
     uint bn = tg.x * 64u;
-    if (bn >= 2304u) return;
+    if (bn >= 2304u || batch == 0u) return;
 
-    uint sg_m = (sg / 2u) * 16u;
-    uint sg_n = (sg % 2u) * 32u;
-
-    threadgroup float smem_f32[2048];
-    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;
-    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 1152;
-
-    uint a_r = tid >> 3;
-    uint a_c4 = (tid & 7u) * 4u;
+    threadgroup float smem_f32[4096];
     uint b_r = tid >> 1;
-    uint b_blk = tid & 1u; // 2 uint4s = 32 MXFP8 elems/row
-
     const device uint4* w_row = (const device uint4*)(w_packed + (size_t(expert) * 2304u + bn + b_r) * 576u);
     const device uchar* s_row = w_scales + (size_t(expert) * 2304u + bn + b_r) * 72u;
+    uint pair_base = tg.x * 32u;
 
-    for (uint base = 0u; base < cnt; base += 32u) {
-        uint batch = min(32u, cnt - base);
-        const device float4* xps[2];
-        for (uint p2 = 0u; p2 < 2u; ++p2) {
-            uint r = p2 * 16u + a_r;
-            uint tok = (r < batch) ? table->expert_tokens[u * 512u + base + r] : 0u;
-            xps[p2] = (const device float4*)(act + size_t(tok) * 2304u);
-        }
+    if (batch <= 16u)      moe_mxfp8_amx_tile<1u, 2304u>(act, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else if (batch <= 32u) moe_mxfp8_amx_tile<2u, 2304u>(act, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else if (batch <= 48u) moe_mxfp8_amx_tile<3u, 2304u>(act, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    else                   moe_mxfp8_amx_tile<4u, 2304u>(act, w_row, s_row, table, expert, base, batch, false, smem_f32, tid, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 acc[2][4];
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-        for (uint k0 = 0u; k0 < 2304u; k0 += 32u) {
-            for (uint p2 = 0u; p2 < 2u; ++p2) {
-                uint r = p2 * 16u + a_r;
-                bfloat4 av = (r < batch) ? bfloat4(xps[p2][(k0 + a_c4) >> 2]) : bfloat4(bfloat(0.0f));
-                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = av;
-            }
-            uint qidx = (k0 >> 4) + b_blk;
-            uint sb = k0 >> 5;
-            uint4 qw = w_row[qidx];
-            float sc = mxfp8_e8m0(s_row[sb]) * 256.0f;
-            threadgroup bfloat4* bp = (threadgroup bfloat4*)(Bs + b_r * 36u + b_blk * 16u);
-            bp[0] = bfloat4(decode4_fp8_scaled(qw.x) * sc);
-            bp[1] = bfloat4(decode4_fp8_scaled(qw.y) * sc);
-            bp[2] = bfloat4(decode4_fp8_scaled(qw.z) * sc);
-            bp[3] = bfloat4(decode4_fp8_scaled(qw.w) * sc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint ks = 0u; ks < 32u; ks += 8u) {
-                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
-                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
-                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
-                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint pair_base = tg.x * 32u;
-        for (uint idx = tid; idx < batch * 32u; idx += 128u) {
-            uint j = idx >> 5;
-            uint pl = idx & 31u;
-            uint tok = table->expert_tokens[u * 512u + base + j];
-            uint slot = table->expert_slots[u * 512u + base + j];
-            float rw = table->expert_weights[u * 512u + base + j];
-            float gv = float(bfloat(smem_f32[j * 64u + pl * 2u]));
-            float uv = float(bfloat(smem_f32[j * 64u + pl * 2u + 1u]));
-            float av = softcap_fn(gv, p.gate_cap) * sigmoid_fn(gv) * softcap_fn(uv, p.up_cap) * rw;
-            mid_out[(tok * 8u + slot) * 1152u + pair_base + pl] = bfloat(av);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < batch * 32u; idx += 128u) {
+        uint j = idx >> 5;
+        uint pl = idx & 31u;
+        uint tok = table->expert_tokens[expert * 1024u + base + j];
+        uint slot = table->expert_slots[expert * 1024u + base + j];
+        float rw = table->expert_weights[expert * 1024u + base + j];
+        float gv = float(bfloat(smem_f32[j * 64u + pl * 2u]));
+        float uv = float(bfloat(smem_f32[j * 64u + pl * 2u + 1u]));
+        float av = softcap_fn(gv, p.gate_cap) * sigmoid_fn(gv) * softcap_fn(uv, p.up_cap) * rw;
+        mid_out[(tok * 8u + slot) * 1152u + pair_base + pl] = bfloat(av);
     }
 }
 
@@ -2091,94 +2528,30 @@ kernel void moe_w2_mxfp8_prefill(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint2 tg [[threadgroup_position_in_grid]])
 {
-    uint u = tg.y;
-    uint expert = table->unique_experts[u];
-    uint cnt = table->expert_counts[u];
+    MoEWorkTile wt = table->work_tiles[tg.y];
+    uint expert = uint(wt.u);
+    uint base = uint(wt.base);
+    uint batch = uint(wt.batch);
     uint bn = tg.x * 64u;
-    if (bn >= 2304u) return;
+    if (bn >= 2304u || batch == 0u) return;
 
-    uint sg_m = (sg / 2u) * 16u;
-    uint sg_n = (sg % 2u) * 32u;
-
-    threadgroup float smem_f32[2048];
-    threadgroup bfloat* As = (threadgroup bfloat*)smem_f32;
-    threadgroup bfloat* Bs = ((threadgroup bfloat*)smem_f32) + 1152;
-
-    uint a_r = tid >> 3;
-    uint a_c4 = (tid & 7u) * 4u;
+    threadgroup float smem_f32[4096];
     uint b_r = tid >> 1;
-    uint b_blk = tid & 1u;
-
     const device uint4* w_row = (const device uint4*)(w_packed + (size_t(expert) * 2304u + bn + b_r) * 288u);
     const device uchar* s_row = w_scales + (size_t(expert) * 2304u + bn + b_r) * 36u;
 
-    for (uint base = 0u; base < cnt; base += 32u) {
-        uint batch = min(32u, cnt - base);
-        const device float4* xps[2];
-        for (uint p2 = 0u; p2 < 2u; ++p2) {
-            uint r = p2 * 16u + a_r;
-            uint ri = (r < batch)
-                          ? (table->expert_tokens[u * 512u + base + r] * 8u +
-                             table->expert_slots[u * 512u + base + r])
-                          : 0u;
-            xps[p2] = (const device float4*)(mid_act + size_t(ri) * 1152u);
-        }
+    if (batch <= 16u)      moe_mxfp8_amx_tile<1u, 1152u>(mid_act, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else if (batch <= 32u) moe_mxfp8_amx_tile<2u, 1152u>(mid_act, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else if (batch <= 48u) moe_mxfp8_amx_tile<3u, 1152u>(mid_act, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    else                   moe_mxfp8_amx_tile<4u, 1152u>(mid_act, w_row, s_row, table, expert, base, batch, true, smem_f32, tid, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 acc[2][4];
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-        for (uint k0 = 0u; k0 < 1152u; k0 += 32u) {
-            for (uint p2 = 0u; p2 < 2u; ++p2) {
-                uint r = p2 * 16u + a_r;
-                bfloat4 av = (r < batch) ? bfloat4(xps[p2][(k0 + a_c4) >> 2]) : bfloat4(bfloat(0.0f));
-                ((threadgroup bfloat4*)(As + r * 36u + a_c4))[0] = av;
-            }
-            uint qidx = (k0 >> 4) + b_blk;
-            uint sb = k0 >> 5;
-            uint4 qw = w_row[qidx];
-            float sc = mxfp8_e8m0(s_row[sb]) * 256.0f;
-            threadgroup bfloat4* bp = (threadgroup bfloat4*)(Bs + b_r * 36u + b_blk * 16u);
-            bp[0] = bfloat4(decode4_fp8_scaled(qw.x) * sc);
-            bp[1] = bfloat4(decode4_fp8_scaled(qw.y) * sc);
-            bp[2] = bfloat4(decode4_fp8_scaled(qw.z) * sc);
-            bp[3] = bfloat4(decode4_fp8_scaled(qw.w) * sc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint ks = 0u; ks < 32u; ks += 8u) {
-                simdgroup_bfloat8x8 a0, a1, b0, b1, b2, b3;
-                simdgroup_load(a0, As + (sg_m + 0u) * 36u + ks, 36);
-                simdgroup_load(a1, As + (sg_m + 8u) * 36u + ks, 36);
-                simdgroup_load(b0, Bs + (sg_n + 0u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b1, Bs + (sg_n + 8u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b2, Bs + (sg_n + 16u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_load(b3, Bs + (sg_n + 24u) * 36u + ks, 36, ulong2(0), true);
-                simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-                simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-                simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-                simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-                simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-                simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-                simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-                simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        for (uint i = 0; i < 2u; ++i)
-            for (uint j = 0; j < 4u; ++j)
-                simdgroup_store(acc[i][j], smem_f32 + (sg_m + i * 8u) * 64u + (sg_n + j * 8u), 64);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint idx = tid; idx < batch * 64u; idx += 128u) {
-            uint j = idx >> 6;
-            uint cl = idx & 63u;
-            uint ri = table->expert_tokens[u * 512u + base + j] * 8u +
-                      table->expert_slots[u * 512u + base + j];
-            down_out[size_t(ri) * 2304u + bn + cl] = float(bfloat(smem_f32[j * 64u + cl]));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < batch * 64u; idx += 128u) {
+        uint j = idx >> 6;
+        uint cl = idx & 63u;
+        uint ri = table->expert_tokens[expert * 1024u + base + j] * 8u +
+                  table->expert_slots[expert * 1024u + base + j];
+        down_out[size_t(ri) * 2304u + bn + cl] = float(bfloat(smem_f32[j * 64u + cl]));
     }
 }
 
@@ -2377,7 +2750,7 @@ kernel void draft_v_to_cache(
     ((device bfloat4*)(v_cache + dst))[0] = ((const device bfloat4*)(inp + src))[0];
 }
 
-struct DraftAttnParams { uint M, start, end, kv_cap, is_ring; float scale; };
+struct DraftAttnParams { uint M, start, end, kv_cap, is_ring, parts; float scale; };
 
 kernel void draft_bidir_attn(
     const device bfloat* q_in [[buffer(0)]],
@@ -2395,7 +2768,7 @@ kernel void draft_bidir_attn(
     const device bfloat* kh = k_cache + size_t(kvh) * p.kv_cap * 128u;
     const device bfloat* vh = v_cache + size_t(kvh) * p.kv_cap * 128u;
     for (uint pos = p.start; pos < p.end; ++pos) {
-        uint slot = (p.is_ring != 0u) ? (pos % p.kv_cap) : pos;
+        uint slot = (p.is_ring != 0u) ? ((p.kv_cap == 2048u) ? (pos & 2047u) : (pos % p.kv_cap)) : pos;
         float4 kf = float4(((const device bfloat4*)(kh + size_t(slot) * 128u + comp))[0]);
         float score = simd_sum(dot(qv, kf));
         float next = max(peak, score);
@@ -2406,6 +2779,112 @@ kernel void draft_bidir_attn(
         peak = next;
     }
     ((device bfloat4*)(out + (size_t(t) * 24u + h) * 128u + comp))[0] = bfloat4(acc * (1.0f / wsum));
+}
+
+// Split-KV + 24x GQA/Block-Shared Draft Bidirectional Attention (for span > 256!)
+// Grid: (parts, 8 KV heads, 1), TG: (128, 1, 1) -> 4 SGs x 6 query rows = all 3 GQA heads x 8 draft tokens!
+// Reads K/V ONCE per shard across all 24 query rows (24x less DRAM traffic, 10-13x faster at 8K-32K!)
+kernel void draft_bidir_attn_split(
+    const device bfloat* q_in [[buffer(0)]],
+    const device bfloat* k_cache [[buffer(1)]],
+    const device bfloat* v_cache [[buffer(2)]],
+    device float* partial_out [[buffer(3)]],
+    device float2* partial_stat [[buffer(4)]],
+    constant DraftAttnParams& p [[buffer(5)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]])
+{
+    uint shard = tg.x, kvh = tg.y, comp = lane * 4u;
+    uint rbase = sg * 6u;
+    float4 qv[6], acc[6];
+    float peak[6], wsum[6];
+    for (uint r = 0u; r < 6u; ++r) {
+        uint qrow = rbase + r;
+        uint h = kvh * 3u + (qrow >> 3);
+        uint t = qrow & 7u;
+        qv[r] = float4(((const device bfloat4*)(q_in + (size_t(t) * 24u + h) * 128u + comp))[0]) * p.scale;
+        acc[r] = float4(0.0f);
+        peak[r] = -INFINITY;
+        wsum[r] = 0.0f;
+    }
+
+    uint total_len = p.end - p.start;
+    uint chunk = (total_len + p.parts - 1u) / p.parts;
+    uint s_start = p.start + shard * chunk;
+    uint s_end = min(p.end, s_start + chunk);
+
+    const device bfloat* kh = k_cache + size_t(kvh) * p.kv_cap * 128u;
+    const device bfloat* vh = v_cache + size_t(kvh) * p.kv_cap * 128u;
+    threadgroup bfloat4 tg_k[8][32];
+    threadgroup bfloat4 tg_v[8][32];
+
+    for (uint pos0 = s_start; pos0 < s_end; pos0 += 8u) {
+        uint npos = min(8u, s_end - pos0);
+        if (sg < npos) {
+            uint pos = pos0 + sg;
+            uint slot = (p.is_ring != 0u) ? ((p.kv_cap == 2048u) ? (pos & 2047u) : (pos % p.kv_cap)) : pos;
+            tg_k[sg][lane] = ((const device bfloat4*)(kh + size_t(slot) * 128u + comp))[0];
+            tg_v[sg][lane] = ((const device bfloat4*)(vh + size_t(slot) * 128u + comp))[0];
+        }
+        if (sg + 4u < npos) {
+            uint pos = pos0 + sg + 4u;
+            uint slot = (p.is_ring != 0u) ? ((p.kv_cap == 2048u) ? (pos & 2047u) : (pos % p.kv_cap)) : pos;
+            tg_k[sg + 4u][lane] = ((const device bfloat4*)(kh + size_t(slot) * 128u + comp))[0];
+            tg_v[sg + 4u][lane] = ((const device bfloat4*)(vh + size_t(slot) * 128u + comp))[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0u; j < npos; ++j) {
+            float4 kf = float4(tg_k[j][lane]);
+            float4 vf = float4(tg_v[j][lane]);
+            for (uint r = 0u; r < 6u; ++r) {
+                float score = simd_sum(dot(qv[r], kf));
+                float next = max(peak[r], score);
+                float prior = fast::exp(peak[r] - next);
+                float prob = fast::exp(score - next);
+                acc[r] = fma(acc[r], prior, prob * vf);
+                wsum[r] = fma(wsum[r], prior, prob);
+                peak[r] = next;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0u; r < 6u; ++r) {
+        uint qrow = rbase + r;
+        uint h = kvh * 3u + (qrow >> 3);
+        uint t = qrow & 7u;
+        uint row = t * 24u + h;
+        uint pbase = (row * p.parts + shard) * 128u + comp;
+        ((device float4*)(partial_out + pbase))[0] = acc[r];
+        if (lane == 0u) partial_stat[row * p.parts + shard] = float2(peak[r], wsum[r]);
+    }
+}
+
+kernel void draft_bidir_attn_merge(
+    const device float* partial_out [[buffer(0)]],
+    const device float2* partial_stat [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant DraftAttnParams& p [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]])
+{
+    uint h = tg.x, t = tg.y, row = t * 24u + h, comp = lane * 4u;
+    float peak = -INFINITY, wsum = 0.0f;
+    float4 acc = float4(0.0f);
+    for (uint s = 0u; s < p.parts; ++s) {
+        float2 st = partial_stat[row * p.parts + s];
+        if (st.y <= 0.0f) continue;
+        float4 pa = ((const device float4*)(partial_out + (row * p.parts + s) * 128u + comp))[0];
+        float next = max(peak, st.x);
+        float prior = (wsum > 0.0f) ? fast::exp(peak - next) : 0.0f;
+        float fac = fast::exp(st.x - next);
+        acc = fma(acc, prior, fac * pa);
+        wsum = fma(wsum, prior, fac * st.y);
+        peak = next;
+    }
+    ((device bfloat4*)(out + size_t(row) * 128u + comp))[0] = bfloat4(acc * (1.0f / wsum));
 }
 
 kernel void draft_swiglu(

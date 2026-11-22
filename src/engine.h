@@ -12,10 +12,10 @@ struct SequenceState {
     int pos = 0;
     int max_global_seq = 0;     // Currently allocated global KV capacity (grows dynamically)
     int max_seq_limit = 262144; // Hard maximum context length (default 256K)
-    int local_kv_cap = 1088;    // 1024 + 64 headroom for speculative rollback
+    int local_kv_cap = 2048;    // Power-of-2 >= 1024 + MAX_M (prevents ring overwrite during M=1024 prefill!)
 
     // Per-visit (48) caches:
-    // Local visits: K/V [8, 1088, 128] BF16
+    // Local visits: K/V [8, 2048, 128] BF16 (ring >= 1024 + MAX_M)
     // Global visits: K/V [8, max_global_seq, 128] BF16
     std::vector<id<MTLBuffer>> k_cache;
     std::vector<id<MTLBuffer>> v_cache;
@@ -25,7 +25,7 @@ struct SequenceState {
     std::vector<id<MTLBuffer>> conv_k, conv_v, conv_attn, conv_mlp;
     std::vector<id<MTLBuffer>> win_k, win_v, win_attn, win_mlp;
 
-    // Draft KV caches (3 layers: L0 & L2 ring 1088, L1 linear max_global_seq)
+    // Draft KV caches (3 layers: L0 & L2 ring 2048, L1 linear max_global_seq)
     int draft_ctx_pos = 0;
     std::vector<id<MTLBuffer>> draft_k_cache;
     std::vector<id<MTLBuffer>> draft_v_cache;
@@ -162,12 +162,18 @@ private:
     id<MTLComputePipelineState> pso_linear_m_[9] = {}; // 1..8 specialized
     id<MTLComputePipelineState> pso_linear_k64_ = nil;
     id<MTLComputePipelineState> pso_linear_tiled_ = nil;
+    id<MTLComputePipelineState> pso_linear_tiled64_ = nil;
     id<MTLComputePipelineState> pso_short_conv_ = nil;
     id<MTLComputePipelineState> pso_short_conv_add_f32_ = nil;
     id<MTLComputePipelineState> pso_short_conv_rollback_ = nil;
+    id<MTLComputePipelineState> pso_short_conv_prefill_ = nil;
+    id<MTLComputePipelineState> pso_short_conv_add_f32_prefill_ = nil;
+    id<MTLComputePipelineState> pso_short_conv_add_bf16_prefill_ = nil;
+    id<MTLComputePipelineState> pso_short_conv_commit_ = nil;
     id<MTLComputePipelineState> pso_attn_prep_qr_ = nil;
     id<MTLComputePipelineState> pso_attn_prep_kv_ = nil;
     id<MTLComputePipelineState> pso_attn_rel_table_ = nil;
+    id<MTLComputePipelineState> pso_attn_rel_table_amx_ = nil;
     id<MTLComputePipelineState> pso_rel_attn_split_ = nil;
     id<MTLComputePipelineState> pso_rel_attn_merge_gate_ = nil;
     id<MTLComputePipelineState> pso_rel_attn_prefill_amx_ = nil;
@@ -175,6 +181,9 @@ private:
     id<MTLComputePipelineState> pso_add_f32_bf16_bf16_ = nil;
     id<MTLComputePipelineState> pso_add_bf16_bf16_bf16_ = nil;
     id<MTLComputePipelineState> pso_moe_topk_ = nil;
+    id<MTLComputePipelineState> pso_moe_topk_parallel_ = nil;
+    id<MTLComputePipelineState> pso_moe_group_bucket_ = nil;
+    id<MTLComputePipelineState> pso_moe_build_worklist_ = nil;
     id<MTLComputePipelineState> pso_nvfp4_quant_act_ = nil;
     id<MTLComputePipelineState> pso_mxfp8_quant_act_ = nil;
     id<MTLComputePipelineState> pso_moe_w13_nvfp4_m1_ = nil;
@@ -195,6 +204,8 @@ private:
     id<MTLComputePipelineState> pso_draft_qk_rope_ = nil;
     id<MTLComputePipelineState> pso_draft_v_cache_ = nil;
     id<MTLComputePipelineState> pso_draft_bidir_attn_ = nil;
+    id<MTLComputePipelineState> pso_draft_bidir_attn_split_ = nil;
+    id<MTLComputePipelineState> pso_draft_bidir_attn_merge_ = nil;
     id<MTLComputePipelineState> pso_draft_swiglu_ = nil;
     id<MTLComputePipelineState> pso_draft_res_add_ = nil;
     id<MTLComputePipelineState> pso_draft_markov_pack_ = nil;
@@ -202,8 +213,8 @@ private:
     id<MTLComputePipelineState> pso_draft_folded_logits_ = nil;
     id<MTLComputePipelineState> pso_precompute_folded_ = nil;
 
-    // Reusable scratch GPU buffers (sized for max M=512 AMX prefill, decode/verify M<=8!)
-    static constexpr int MAX_M = 512;
+    // Reusable scratch GPU buffers (sized for max M=1024 AMX prefill, decode/verify M<=8!)
+    static constexpr int MAX_M = 1024;
     static constexpr int MAX_LOGITS_M = 8;
     id<MTLBuffer> buf_tok_ids_ = nil;
     id<MTLBuffer> buf_argmax_ = nil;

@@ -265,7 +265,7 @@ void PrefixCache::pack_checkpoint_payload(const SequenceState& seq,
     out.clear();
     const int win_target = weights.cfg.window; // 1024
     const int win_draft = weights.draft.loaded ? weights.draft.window : 1024;
-    const int cap = seq.local_kv_cap; // 1088
+    const int cap = seq.local_kv_cap; // 2048
     const size_t row_bytes = 128u * 2u;
     const size_t head_stride = static_cast<size_t>(cap) * row_bytes;
 
