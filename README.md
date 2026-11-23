@@ -16,24 +16,26 @@ Benchmark prompt: *"Write a short Python function to compute Fibonacci numbers i
 | **inkling** — Concurrent Batch `B=4` | 0.96 s | **100.84 agg tok/s** (25.2 tok/s/seq) | **3.26×** | **128 / 128** |
 | **inkling** — Concurrent Batch `B=8` | 0.96 s | **132.01 agg tok/s** (16.5 tok/s/seq) | **4.27×** | **128 / 128** |
 
-### Prefill Throughput & Hardware Roofline (Apple M4 Pro: 6.55 TFLOPS AMX Peak, 254 GB/s DRAM)
+### Prefill Throughput & Hardware Roofline (Apple M4 Pro: 6.55 TFLOPS GPU AMX Peak + 3.86 TFLOPS ARMv9 SME2)
 
-| Prompt Length (Diverse Code) | Prefill Latency | Prefill Throughput | % of 711 tok/s Theoretical Roofline |
+| Prompt Length (Diverse Code) | GPU-Only (Concurrent) | `--hetero` (GPU + ARMv9 SME2) | Speedup vs GPU-Only |
 | :--- | :---: | :---: | :---: |
-| 512 tokens | 1.06 s | **483.5 tok/s** | 68.0% |
-| 1,024 tokens | 1.89 s | **541.4 tok/s** | **76.1%** |
-| 4,096 tokens | 7.96 s | **514.3 tok/s** | 72.3% |
-| 8,192 tokens | 16.35 s | **501.0 tok/s** | 70.5% |
-| 11,118 tokens | 22.71 s | **489.5 tok/s** | 72.6% (of 674 tok/s @ 11K) |
+| 1,024 tokens | 1.84 s (**557.8 tok/s**, 78.5% GPU roofline) | **1.60 s (640.3 tok/s)** | **1.15×** |
+| 4,096 tokens | 7.77 s (**526.9 tok/s**, 74.1% GPU roofline) | **6.71 s (610.8 tok/s)** | **1.16×** |
+| 11,118 tokens | 22.18 s (**501.2 tok/s**, 74.4% GPU roofline) | **19.62 s (566.8 tok/s)** | **1.13×** |
 
 ## Architecture & M4 Pro Specializations
 
 - **Zero-Copy Weight Loading + Load-Time Fusion ([`model_weights.mm`](src/model_weights.mm)):**
-  - Directly `mmap`s Ollama's local safetensors blobs (`newBufferWithBytesNoCopy:`, closing FDs immediately to stay under `ulimit -n`).
+  - Directly `mmap`s either Ollama's local safetensors blobs or a standard Hugging Face model directory (`--model-dir`, supporting both `model.safetensors.index.json` and direct `*.safetensors` + optional `draft/` subfolder) via `newBufferWithBytesNoCopy:`, closing FDs immediately to stay under `ulimit -n`.
   - Pre-packs per-layer BF16 projections at load time (local layers fused into `[8600, 2304]` `[Q, R, Gate, Sink, K, V]`; loop controllers fused into `[4608, 64]`; draft QKV/FFN fused; Markov head folded on GPU into `[200058, 256]` BF16).
-- **Single-Command-Buffer 48-Visit Target Forward ([`engine.mm`](src/engine.mm), [`kernels.metal`](src/kernels.metal)):**
-  - Executes the full looped MoE schedule (`L0..5`, `L6..17 × 3` with cross-pass residual attention & rank-64 loop controllers, `L18..23`) inside a single Metal compute command encoder.
+- **Single-Command-Buffer Concurrent Target Forward ([`engine.mm`](src/engine.mm), [`kernels.metal`](src/kernels.metal)):**
+  - Executes the full looped MoE schedule (`L0..5`, `L6..17 × 3` with cross-pass residual attention & rank-64 loop controllers, `L18..23`) inside a single `MTLDispatchTypeConcurrent` command encoder with explicit buffer barriers (overlapping independent Q/K/V controllers, Q/K/V projections, K/V short-convs + QR prep, KV prep + rel-table, WO + boundary copies, and router + act-quant).
   - Fused `BlockResidualMix + RMSNorm`, `AttnPrep (ClipL2 + V-RMSNorm + KV-Write)`, `RelativePositionAttention + OutputGate`, `ShortConv + ResidualAdd`, and `MoEReduce + MLPShortConv + ResidualAdd` (eliminating 144 dispatches/forward).
+  - Hardware GPU Perfetto / `chrome://tracing` timestamp dumper (`--trace <path.json>`) using `MTLCounterSampleBuffer`.
+- **Opt-In Heterogeneous Prefill (`--hetero`, [`hetero_prefill.mm`](src/hetero_prefill.mm)):**
+  - Runs Metal GPU AMX and 10-core **ARMv9 SME2** (`-mcpu=apple-m4`, `<arm_sme.h>`) simultaneously over unified memory (`+0 MB` extra weight RAM, 6 MB activation scratch) for `M >= 256` chunks via pre-committed command buffers and `MTLSharedEvent` handshakes.
+  - Splits dense BF16 `QKV`/`WO` using native `svmopa_za32_bf16_m` (`BK=512` L1D-resident panels) and NVFP4 MoE `W13`/`W2` using 4-row NEON `vqtbl1q_s8` + 4×4 transpose unpack into `svmopa_za32_f16_m`, with fat-tiles-last worklist sorting (`batch < 48` on GPU's 4-bucket AMX, `batch >= 48` on SME2). Decode (`M <= 8`) and batch paths are 100% untouched.
 - **Coalesced Indirect-Dispatch MoE Kernels (NVFP4 L0–19 & MXFP8 L20–23):**
   - GPU-side top-8 routing + unique-expert bucketing (`moe_topk_and_group`) drives `dispatchThreadgroupsWithIndirectBuffer`, reading each unique active expert **once** across all tokens in a speculative verify block or concurrent batch.
   - Pure SIMD ALU NVFP4/FP8 decoders (`decode4_e2m1_scaled`, `decode4_fp8_scaled`) with zero constant-cache LUT stalls, bit-exact `half4` quantized activations, and zero-barrier / zero-shared-memory layouts hitting **215–223 GB/s** on M4 Pro (NVFP4 W13 2 pairs/SG + no-barrier MXFP8).
@@ -79,7 +81,7 @@ make format
 # OpenAI Chat Completions-compatible HTTP server (DSpark speculative on by default!)
 ./build/inkling --serve --host 127.0.0.1 --port 8080
 
-# Heterogeneous Metal GPU + ARMv9 SME2 prefill (+13-16% faster prefill, +0 MB extra RAM)
+# Heterogeneous Metal GPU + ARMv9 SME2 prefill (+13-16% faster prefill, +0 MB extra weight RAM)
 ./build/inkling --spec --hetero --max-tokens 256 --prompt "..."
 
 # Load directly from a standard Hugging Face model directory (config.json, tokenizer.json, *.safetensors)
@@ -88,7 +90,7 @@ make format
 
 ### OpenAI-Compatible API (`--serve`)
 
-- **Roofline-Tuned AMX Prefill (`M=1024` MoE + FlashAttention-2 + Dense Tiled64):** Uses `BM=64, BN=64, BK=32` BF16 AMX GEMMs (`linear_bf16_tiled64`, **6.33 TFLOPS = 97% of M4 Pro peak**), 4-bucket branch-free `BM=16/32/48/64` FP16-AMX NVFP4 & BF16-AMX MXFP8 MoE kernels driven by 128-TG parallel routing + 64-token load-balanced worklists (`1.34 ms` across 48 visits), AMX relative-position table GEMM (23.6× faster), parallel 2D FIR short-conv prefill (3.9× faster), and `BM=16, BN=32` 16-byte-vectorized FlashAttention-2 (with `no_rel_bias` unmasked global interior fast path + power-of-2 2048-slot ring cache) reaching **489–541 tok/s** sustained prefill from 1K to 11K+ tokens (**76% of the 711 tok/s theoretical M4 Pro roofline**, 4.75× faster than decode-kernel prefill) with live progress logs and SSE keepalives.
+- **Roofline-Tuned AMX Prefill (`M=1024` MoE + FlashAttention-2 + Dense Tiled64):** Uses `BM=64, BN=64, BK=32` BF16 AMX GEMMs (`linear_bf16_tiled64`, **6.33 TFLOPS = 97% of M4 Pro peak**), 4-bucket branch-free `BM=16/32/48/64` FP16-AMX NVFP4 & BF16-AMX MXFP8 MoE kernels driven by 128-TG parallel routing + 64-token load-balanced worklists (`1.34 ms` across 48 visits), AMX relative-position table GEMM (23.6× faster), parallel 2D FIR short-conv prefill (3.9× faster), and `BM=16, BN=32` 16-byte-vectorized FlashAttention-2 (with `no_rel_bias` unmasked global interior fast path + power-of-2 2048-slot ring cache) reaching **501–558 tok/s** GPU-only (**74–78% of M4 Pro GPU roofline**) and **567–640 tok/s** with `--hetero` (Metal GPU + ARMv9 SME2) across 1K–11K+ tokens, with live progress logs and SSE keepalives.
 - **2-Tier RAM + NVMe Offload Prefix Cache (`--serve`):** Content-addressed `256`-token Global KV block deduplication + compacted sliding-window/conv checkpoints (`min(pos, 1024)` slots) across multiple concurrent sessions/subagents, mid-conversation branches/retries, periodic 4K milestones, and aborted prefills. Strictly bounded by `--cache-ram-mb` (default `4096`) and `--cache-disk-mb` (default `16384`, `--cache-dir` default `~/.cache/inkling`), automatically offloading cold entries to NVMe SSD (~50–70 ms reload) and cleaning up its session offload directory on shutdown. Inspect/clear via `GET /v1/cache` / `DELETE /v1/cache` and `GET /health`; reports `cached_tokens` in OpenAI `usage`.
 - **OpenAI-Compatible API (`--serve`):** Multi-threaded HTTP/1.1 server (with `SO_RCVTIMEO`, `Transfer-Encoding: chunked`, and non-blocking `GET /health`, `GET /props`, `GET /v1/models`, `GET /v1/cache`) supporting `POST /v1/chat/completions` and `POST /v1/responses` (sync & SSE streaming, `reasoning_content` / `reasoning` + `content` / `output_text`, native Inkling 2 tool calling via `tools` / `tool_calls` / `function_call` / `function_call_output`, `prompt_cache_key`, `max_tokens`/`max_output_tokens`, `temperature`, `top_p`, `seed`, `stop`, and `reasoning_effort`). Default context is **262,144** with dynamic grow-on-demand global KV caches (configurable via `--max-seq`).
 
