@@ -1519,6 +1519,8 @@ struct MoERouteTable {
     float top_ws[1024 * 8];
     uint num_work_tiles;
     MoEWorkTile work_tiles[512];
+    uint gpu_tiles_w13;
+    uint gpu_tiles_w2;
 };
 
 struct RouterParams {
@@ -1526,6 +1528,8 @@ struct RouterParams {
     uint w13_grid_x;
     uint w2_grid_x;
     float route_scale;
+    uint w13_gpu_pct;
+    uint w2_gpu_pct;
 };
 
 // Parallel top-8 selection across all M tokens (for prefill M > 8): 1 thread per token!
@@ -1646,8 +1650,49 @@ kernel void moe_build_worklist_64(
     if (e == 0u) {
         uint total_tiles = sg_totals[0] + sg_totals[1] + sg_totals[2] + sg_totals[3];
         table->num_work_tiles = total_tiles;
-        ind_w13->x = p.w13_grid_x; ind_w13->y = total_tiles; ind_w13->z = 1u;
-        ind_w2->x  = p.w2_grid_x;  ind_w2->y  = total_tiles; ind_w2->z  = 1u;
+
+        // When splitting with CPU SME2, partition small tiles (batch < 48) first for GPU's 4-bucket AMX
+        // and fat tiles (batch >= 48, mostly 64) last for SME2 -> maximizes SME2 weight-unpack reuse!
+        if (p.w13_gpu_pct < 100u || p.w2_gpu_pct < 100u) {
+            uint write_pos = 0u;
+            for (uint ti = 0u; ti < total_tiles; ++ti) {
+                if (table->work_tiles[ti].batch < 48u) {
+                    if (ti != write_pos) {
+                        MoEWorkTile tmp = table->work_tiles[write_pos];
+                        table->work_tiles[write_pos] = table->work_tiles[ti];
+                        table->work_tiles[ti] = tmp;
+                    }
+                    write_pos++;
+                }
+            }
+        }
+
+        uint gt13 = total_tiles;
+        uint gt2  = total_tiles;
+        if (p.w13_gpu_pct < 100u) {
+            uint target13 = (p.M * 8u * p.w13_gpu_pct) / 100u;
+            uint acc = 0u;
+            gt13 = 0u;
+            for (uint ti = 0u; ti < total_tiles; ++ti) {
+                if (acc >= target13) break;
+                acc += uint(table->work_tiles[ti].batch);
+                gt13 = ti + 1u;
+            }
+        }
+        if (p.w2_gpu_pct < 100u) {
+            uint target2 = (p.M * 8u * p.w2_gpu_pct) / 100u;
+            uint acc = 0u;
+            gt2 = 0u;
+            for (uint ti = 0u; ti < total_tiles; ++ti) {
+                if (acc >= target2) break;
+                acc += uint(table->work_tiles[ti].batch);
+                gt2 = ti + 1u;
+            }
+        }
+        table->gpu_tiles_w13 = gt13;
+        table->gpu_tiles_w2  = gt2;
+        ind_w13->x = p.w13_grid_x; ind_w13->y = gt13; ind_w13->z = 1u;
+        ind_w2->x  = p.w2_grid_x;  ind_w2->y  = gt2;  ind_w2->z  = 1u;
     }
 }
 

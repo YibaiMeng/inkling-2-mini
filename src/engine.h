@@ -1,5 +1,6 @@
 #pragma once
 #import <Metal/Metal.h>
+#include "hetero_prefill.h"
 #include "model_weights.h"
 #include "prefix_cache.h"
 #include "tokenizer.h"
@@ -77,7 +78,14 @@ public:
     InklingWeights weights;
     InklingTokenizer tokenizer;
     PrefixCache prefix_cache;
+    HeteroPrefill hetero_prefill;
     bool use_concurrent_dispatch = true; // MTLDispatchTypeConcurrent for independent kernels + explicit barriers
+
+    // Opt-in pure user-space heterogeneous prefill (Metal GPU + ARMv9 SME2 CPU, +0 MB RAM).
+    // Decode (M <= 8) and batch paths are 100% untouched.
+    bool enable_hetero_prefill(bool enable_dense_sme2 = true, bool enable_moe_sme2 = true) {
+        return hetero_prefill.init(enable_dense_sme2, enable_moe_sme2);
+    }
 
     // Request a hardware-timestamped Perfetto / chrome://tracing JSON dump on the next forward_target_single() call.
     void set_next_trace_path(const std::string& json_path) { next_trace_path_ = json_path; }
@@ -240,6 +248,8 @@ private:
     id<MTLBuffer> buf_ctrl_down_[3] = {};
     id<MTLBuffer> buf_ctrl_gf_[3] = {};
     id<MTLCounterSampleBuffer> trace_csb_ = nil;
+    id<MTLSharedEvent> hetero_ev_ = nil;
+    uint64_t hetero_ev_val_ = 0;
     std::string next_trace_path_;
 
     id<MTLBuffer> buf_q_proj_ = nil;        // [MAX_M, 8592] BF16
@@ -335,6 +345,12 @@ private:
                     uint32_t M,
                     bool do_reduce = true,
                     bool concurrent = false);
+
+    std::vector<int32_t> forward_target_prefill_hetero(SequenceState& seq,
+                                                       const std::vector<int32_t>& tokens,
+                                                       bool capture_taps,
+                                                       std::vector<float>* last_logits_out,
+                                                       LogitsMode logits_mode);
 
     int32_t sample_logits_cpu(const float* logits,
                               const SamplingParams& sampling,

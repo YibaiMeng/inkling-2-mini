@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sched.h>
 #include <sstream>
 
 namespace {
@@ -48,6 +49,8 @@ struct RelAttnParams {
 struct RouterParams {
     uint32_t M, w13_grid_x, w2_grid_x;
     float route_scale;
+    uint32_t w13_gpu_pct;
+    uint32_t w2_gpu_pct;
 };
 
 struct MoEQuantParams {
@@ -105,7 +108,7 @@ bool InklingEngine::init(const std::string& manifest_path,
         fprintf(stderr, "Metal device unavailable!\n");
         return false;
     }
-    queue = [device newCommandQueue];
+    queue = [device newCommandQueueWithMaxCommandBufferCount:512];
 
     // Compile Metal shaders
     std::ifstream mf(metal_path);
@@ -258,6 +261,8 @@ bool InklingEngine::init(const std::string& manifest_path,
             trace_csb_ = [device newCounterSampleBufferWithDescriptor:cdesc error:&cerr];
         }
     }
+    hetero_ev_ = [device newSharedEvent];
+    hetero_ev_val_ = 0;
 
     buf_q_proj_      = alloc(MAX_M * 8600 * 2);
     buf_k_proj_      = alloc(MAX_M * 1056 * 2);
@@ -703,7 +708,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
     const bool use_amx_prefill = (M > 8u);
     uint32_t w13_gx = use_amx_prefill ? 36u : ((M == 1u && lw.w13.is_nvfp4) ? 144u : 288u);
     uint32_t w2_gx  = use_amx_prefill ? 36u : (lw.w2.is_nvfp4 ? 144u : 288u);
-    RouterParams rp{M, w13_gx, w2_gx, weights.cfg.route_scale};
+    RouterParams rp{M, w13_gx, w2_gx, weights.cfg.route_scale, 100u, 100u};
 
     // Wave 1 (CONCURRENT!): Router GEMV/GEMM [128, 2304] AND Activation Quantization both read ffn_in!
     encode_linear(enc, ffn_in, 0, false, lw.router_w, nil, 0, false,
@@ -923,6 +928,9 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                                                           std::vector<float>* last_logits_out,
                                                           LogitsMode logits_mode) {
     const uint32_t M = static_cast<uint32_t>(tokens.size());
+    if (hetero_prefill.ready() && M >= 256u && !save_conv_windows && next_trace_path_.empty()) {
+        return forward_target_prefill_hetero(seq, tokens, capture_taps, last_logits_out, logits_mode);
+    }
     const uint32_t D = weights.cfg.hidden_size; // 2304
     const float eps = weights.cfg.norm_eps;
     const uint32_t start_pos = static_cast<uint32_t>(seq.pos);
@@ -1497,6 +1505,650 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
         std::memcpy(last_logits_out->data(), lp, V * sizeof(float));
     }
 
+    return out;
+}
+
+// ============================================================================
+// Zero-Bubble Single-CB Heterogeneous Prefill (Metal GPU + ARMv9 SME2 CPU)
+//   - Encodes ALL 48 visits into ONE MTLCommandBuffer with MTLSharedEvent handshakes!
+//   - Zero GPU idle bubbles between MixCtrl->QKV, Attn->WO, Worklist->W13, QuantAct->W2!
+//   - Zero CoreML, zero IOSurface, zero extra weight RAM!
+// ============================================================================
+std::vector<int32_t> InklingEngine::forward_target_prefill_hetero(SequenceState& seq,
+                                                                  const std::vector<int32_t>& tokens,
+                                                                  bool capture_taps,
+                                                                  std::vector<float>* last_logits_out,
+                                                                  LogitsMode logits_mode) {
+    const uint32_t M = static_cast<uint32_t>(tokens.size());
+    const uint32_t D = weights.cfg.hidden_size; // 2304
+    const float eps = weights.cfg.norm_eps;
+    const uint32_t start_pos = static_cast<uint32_t>(seq.pos);
+    ensure_global_capacity(seq, seq.pos + static_cast<int>(M));
+
+    std::memcpy(buf_tok_ids_.contents, tokens.data(), M * sizeof(int32_t));
+
+    const bool conc = use_concurrent_dispatch;
+    const MTLDispatchType dtype = conc ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+    const bool do_dense_sme = hetero_prefill.dense_ready() && (M >= 256u);
+    const bool sme2_avail = hetero_prefill.moe_ready();
+    const size_t act_bytes = size_t(M) * D * 2u;
+    auto split_m_gpu = [&](int pct) -> uint32_t {
+        uint32_t target = static_cast<uint32_t>((uint64_t(M) * static_cast<uint64_t>(std::clamp(pct, 0, 100))) / 100u);
+        uint32_t r64 = ((target + 32u) / 64u) * 64u;
+        return std::min<uint32_t>(M, r64);
+    };
+
+    struct HostStep {
+        int layer;
+        int kind; // 0=QKV, 1=WO, 2=W13, 3=W2
+        uint32_t m_gpu;
+        uint32_t m_sme;
+        uint32_t q_stride;
+        uint64_t wait_val;
+        uint64_t sig_val;
+    };
+    std::vector<HostStep> host_steps;
+    host_steps.reserve(192);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:dtype];
+
+        auto barrier = [&]() {
+            if (conc && enc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        };
+        auto split_signal = [&]() -> uint64_t {
+            [enc endEncoding];
+            uint64_t v = ++hetero_ev_val_;
+            [cb encodeSignalEvent:hetero_ev_ value:v];
+            [cb commit];
+            cb = [queue commandBuffer];
+            enc = [cb computeCommandEncoderWithDispatchType:dtype];
+            return v;
+        };
+        auto split_wait = [&]() -> uint64_t {
+            [enc endEncoding];
+            uint64_t v = ++hetero_ev_val_;
+            [cb encodeWaitForEvent:hetero_ev_ value:v];
+            enc = [cb computeCommandEncoderWithDispatchType:dtype];
+            return v;
+        };
+
+        auto blit_copy = [&](id<MTLBuffer> src, id<MTLBuffer> dst, size_t nbytes) {
+            uint32_t n4 = static_cast<uint32_t>(nbytes / 8u);
+            [enc setComputePipelineState:pso_copy_bf16_];
+            [enc setBuffer:src offset:0 atIndex:0];
+            [enc setBuffer:dst offset:0 atIndex:1];
+            [enc setBytes:&n4 length:4 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(n4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        };
+
+        auto dispatch_mix = [&](__strong id<MTLBuffer>* srcs, uint32_t nsrc, uint32_t f32_mask,
+                                const TensorRef& query, uint32_t nq,
+                                bool apply_norm,
+                                const TensorRef* n0, const TensorRef* n1, const TensorRef* n2,
+                                id<MTLBuffer> out_f32, id<MTLBuffer> out_bf16) {
+            BlockMixParams p{nsrc, nq, f32_mask, apply_norm ? 1u : 0u, eps};
+            [enc setComputePipelineState:pso_block_mix_];
+            for (uint32_t s = 0; s < 5u; ++s) {
+                [enc setBuffer:srcs[std::min(s, nsrc - 1u)] offset:0 atIndex:s];
+            }
+            [enc setBuffer:query.buf offset:query.offset atIndex:5];
+            [enc setBuffer:(n0 ? n0->buf : buf_partial_bf16_) offset:(n0 ? n0->offset : 0) atIndex:6];
+            [enc setBuffer:(n1 ? n1->buf : buf_partial_bf16_) offset:(n1 ? n1->offset : 0) atIndex:7];
+            [enc setBuffer:(n2 ? n2->buf : buf_partial_bf16_) offset:(n2 ? n2->offset : 0) atIndex:8];
+            [enc setBuffer:out_f32 offset:0 atIndex:9];
+            [enc setBuffer:out_bf16 offset:0 atIndex:10];
+            [enc setBytes:&p length:sizeof(p) atIndex:11];
+            [enc dispatchThreadgroups:MTLSizeMake(1, nq, M) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+        };
+
+        // 0. Embed + EmbedNorm -> buf_partial_bf16_ [M, 2304]
+        [enc setComputePipelineState:pso_embed_rms_];
+        [enc setBuffer:buf_tok_ids_ offset:0 atIndex:0];
+        [enc setBuffer:weights.embed.buf offset:weights.embed.offset atIndex:1];
+        [enc setBuffer:weights.embed_norm.buf offset:weights.embed_norm.offset atIndex:2];
+        [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:3];
+        [enc setBytes:&eps length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+        barrier();
+
+        int num_blocks = 0;
+        int prelude_num_blocks = 0;
+        int tap_idx = 0;
+
+        for (size_t vi = 0; vi < weights.plan.size(); ++vi) {
+            const auto& visit = weights.plan[vi];
+            const auto& lw = weights.layers[visit.layer];
+            bool boundary = (visit.layer % weights.cfg.residual_block_size == 0);
+
+            if (visit.layer == weights.cfg.loop_start) {
+                if (visit.pass == 0) {
+                    prelude_num_blocks = num_blocks;
+                    blit_copy(buf_partial_bf16_, buf_prelude_partial_, act_bytes);
+                } else {
+                    blit_copy(buf_res_blocks_[prelude_num_blocks + 1], buf_prev_blocks_[0], act_bytes);
+                    blit_copy(buf_partial_bf16_, buf_prev_blocks_[1], act_bytes);
+                    barrier();
+                    num_blocks = prelude_num_blocks;
+                    blit_copy(buf_prelude_partial_, buf_partial_bf16_, act_bytes);
+                    barrier();
+                }
+            }
+
+            if (capture_taps && tap_idx < 3 && static_cast<int>(vi) == weights.draft.taps[tap_idx]) {
+                blit_copy(buf_partial_bf16_, buf_taps_[tap_idx], act_bytes);
+                tap_idx++;
+            }
+
+            bool has_msg = (visit.pass > 0);
+            if (num_blocks == 0) {
+                [enc setComputePipelineState:pso_rms_bf16_];
+                [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:0];
+                [enc setBuffer:lw.attn_norm[0].buf offset:lw.attn_norm[0].offset atIndex:1];
+                [enc setBuffer:buf_norm_in_[0] offset:0 atIndex:2];
+                [enc setBytes:&eps length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+                barrier();
+            } else {
+                id<MTLBuffer> srcs[5];
+                for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
+                srcs[num_blocks] = buf_partial_bf16_;
+                uint32_t nsrc = static_cast<uint32_t>(num_blocks + 1);
+                uint32_t nq = lw.is_local ? 1u : 3u;
+
+                if (!has_msg) {
+                    if (lw.is_local) {
+                        dispatch_mix(srcs, nsrc, 0u, lw.attn_query, 1, true,
+                                     &lw.attn_norm[0], nullptr, nullptr, buf_mix_f32_, buf_norm_in_[0]);
+                    } else {
+                        for (int q_i = 0; q_i < 3; ++q_i) {
+                            TensorRef qsub = lw.attn_query;
+                            qsub.offset += size_t(q_i) * D * sizeof(float);
+                            dispatch_mix(srcs, nsrc, 0u, qsub, 1, true,
+                                         &lw.attn_norm[q_i], nullptr, nullptr, buf_mix_f32_, buf_norm_in_[q_i]);
+                        }
+                    }
+                    barrier();
+                } else {
+                    id<MTLBuffer> psrcs[5] = {buf_prev_blocks_[0], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1]};
+                    dispatch_mix(psrcs, 2, 0u, lw.msg_queries, 4, false, nullptr, nullptr, nullptr,
+                                 buf_msg_f32_, buf_norm_in_[0]);
+                    dispatch_mix(srcs, nsrc, 0u, lw.attn_query, nq, false,
+                                 nullptr, nullptr, nullptr, buf_mix_f32_, buf_norm_in_[0]);
+                    barrier();
+                    encode_controllers_3way(enc, lw, buf_mix_f32_, nq * D, lw.is_local, buf_msg_f32_, M, conc);
+                    barrier();
+                }
+            }
+
+            // ----- QKV Projection: Zero-Bubble MTLSharedEvent Split -----
+            uint32_t q_stride = (lw.is_local && !has_msg) ? 8600u : 6552u;
+            const uint32_t r_offset = 3072u, gate_offset = 3456u, sink_offset = 6528u;
+            uint32_t qkv_m_gpu = do_dense_sme ? split_m_gpu(hetero_prefill.dense_qkv_gpu_pct) : M;
+            uint32_t qkv_m_sme = M - qkv_m_gpu;
+            if (qkv_m_sme > 0u) {
+                uint64_t ev_ready = split_signal(); // Signals CPU right as GPU starts GPU_QKV!
+                if (lw.is_local && !has_msg) {
+                    if (qkv_m_gpu > 0u) {
+                        encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
+                                      buf_q_proj_, 0, false, qkv_m_gpu, 8600u, D);
+                    }
+                } else if (lw.is_local && has_msg) {
+                    if (qkv_m_gpu > 0u) {
+                        encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
+                                      buf_q_proj_, 0, false, qkv_m_gpu, 6552u, D);
+                    }
+                    TensorRef wk_ref = lw.fused_q_proj; wk_ref.offset += size_t(6552) * D * 2u;
+                    TensorRef wv_ref = lw.fused_q_proj; wv_ref.offset += size_t(7576) * D * 2u;
+                    encode_linear(enc, buf_norm_in_[1], 0, false, wk_ref, nil, 0, false, buf_k_proj_, 0, false, M, 1024u, D);
+                    encode_linear(enc, buf_norm_in_[2], 0, false, wv_ref, nil, 0, false, buf_v_proj_, 0, false, M, 1024u, D);
+                } else {
+                    if (qkv_m_gpu > 0u) {
+                        encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
+                                      buf_q_proj_, 0, false, qkv_m_gpu, 6552u, D);
+                    }
+                    encode_linear(enc, buf_norm_in_[1], 0, false, lw.fused_k_proj, nil, 0, false, buf_k_proj_, 0, false, M, 1056u, D);
+                    encode_linear(enc, buf_norm_in_[2], 0, false, lw.fused_v_proj, nil, 0, false, buf_v_proj_, 0, false, M, 1056u, D);
+                }
+                uint64_t ev_done = split_wait(); // Wait for CPU SME2 QKV before SConvPrep!
+                host_steps.push_back({visit.layer, 0, qkv_m_gpu, qkv_m_sme, q_stride, ev_ready, ev_done});
+            } else {
+                if (lw.is_local && !has_msg) {
+                    encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
+                                  buf_q_proj_, 0, false, M, 8600u, D);
+                } else if (lw.is_local && has_msg) {
+                    encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
+                                  buf_q_proj_, 0, false, M, 6552u, D);
+                    TensorRef wk_ref = lw.fused_q_proj; wk_ref.offset += size_t(6552) * D * 2u;
+                    TensorRef wv_ref = lw.fused_q_proj; wv_ref.offset += size_t(7576) * D * 2u;
+                    encode_linear(enc, buf_norm_in_[1], 0, false, wk_ref, nil, 0, false, buf_k_proj_, 0, false, M, 1024u, D);
+                    encode_linear(enc, buf_norm_in_[2], 0, false, wv_ref, nil, 0, false, buf_v_proj_, 0, false, M, 1024u, D);
+                } else {
+                    encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false, buf_q_proj_, 0, false, M, 6552u, D);
+                    encode_linear(enc, buf_norm_in_[1], 0, false, lw.fused_k_proj, nil, 0, false, buf_k_proj_, 0, false, M, 1056u, D);
+                    encode_linear(enc, buf_norm_in_[2], 0, false, lw.fused_v_proj, nil, 0, false, buf_v_proj_, 0, false, M, 1056u, D);
+                }
+                barrier();
+            }
+
+            // ----- ShortConv(K, V) + AttnPrep(QR, KV) + RelTable + FlashAttention-2 -----
+            uint32_t kv_cap = visit.local ? static_cast<uint32_t>(seq.local_kv_cap) : static_cast<uint32_t>(seq.max_global_seq);
+            AttnPrepParams app{
+                M, start_pos, kv_cap, visit.local ? 1u : 0u,
+                q_stride, r_offset,
+                weights.cfg.qk_clip, weights.cfg.rel_clip, eps,
+                visit.local ? 0.0f : weights.cfg.log_floor,
+                visit.local ? 0.0f : weights.cfg.log_alpha
+            };
+            if (lw.is_local && !has_msg) {
+                encode_short_conv(enc, buf_q_proj_, 0, 8600u, 6552u, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], false, buf_k_conv_, 0, M, 1024u, false, 0, 0, true);
+                encode_short_conv(enc, buf_q_proj_, 0, 8600u, 7576u, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], false, buf_v_conv_, 0, M, 1024u, false, 0, 0, true);
+            } else if (lw.is_local && has_msg) {
+                encode_short_conv(enc, buf_k_proj_, 0, 1024u, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], false, buf_k_conv_, 0, M, 1024u, false, 0, 0, true);
+                encode_short_conv(enc, buf_v_proj_, 0, 1024u, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], false, buf_v_conv_, 0, M, 1024u, false, 0, 0, true);
+            } else {
+                encode_short_conv(enc, buf_k_proj_, 0, 1056u, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], false, buf_k_conv_, 0, M, 1024u, true, 1056u, 1024u, true);
+                encode_short_conv(enc, buf_v_proj_, 0, 1056u, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], false, buf_v_conv_, 0, M, 1024u, true, 1056u, 1024u, true);
+            }
+            [enc setComputePipelineState:pso_attn_prep_qr_];
+            [enc setBuffer:buf_q_proj_ offset:0 atIndex:0];
+            [enc setBuffer:lw.q_scale.buf offset:lw.q_scale.offset atIndex:1];
+            [enc setBuffer:lw.rel_scale.buf offset:lw.rel_scale.offset atIndex:2];
+            [enc setBuffer:buf_q_f32_ offset:0 atIndex:3];
+            [enc setBuffer:buf_r_bf16_ offset:0 atIndex:4];
+            [enc setBytes:&app length:sizeof(app) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(24, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            barrier();
+
+            {
+                auto commit_kv = [&](id<MTLBuffer> xb, uint32_t xs, uint32_t xo, id<MTLBuffer> st) {
+                    ShortConvParams cp{M, 1024u, xs, xo, 0u, 0u, 0u, 0u};
+                    [enc setComputePipelineState:pso_short_conv_commit_];
+                    [enc setBuffer:xb offset:0 atIndex:0];
+                    [enc setBuffer:st offset:0 atIndex:1];
+                    [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(1024u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                };
+                if (lw.is_local && !has_msg) {
+                    commit_kv(buf_q_proj_, 8600u, 6552u, seq.conv_k[vi]);
+                    commit_kv(buf_q_proj_, 8600u, 7576u, seq.conv_v[vi]);
+                } else if (lw.is_local && has_msg) {
+                    commit_kv(buf_k_proj_, 1024u, 0u, seq.conv_k[vi]);
+                    commit_kv(buf_v_proj_, 1024u, 0u, seq.conv_v[vi]);
+                } else {
+                    commit_kv(buf_k_proj_, 1056u, 0u, seq.conv_k[vi]);
+                    commit_kv(buf_v_proj_, 1056u, 0u, seq.conv_v[vi]);
+                }
+            }
+            [enc setComputePipelineState:pso_attn_prep_kv_];
+            [enc setBuffer:buf_k_conv_ offset:0 atIndex:0];
+            [enc setBuffer:buf_v_conv_ offset:0 atIndex:1];
+            [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:2];
+            [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:3];
+            [enc setBytes:&app length:sizeof(app) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(8, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+            {
+                uint32_t total_rows = M * 24u;
+                [enc setComputePipelineState:pso_attn_rel_table_amx_];
+                [enc setBuffer:buf_r_bf16_ offset:0 atIndex:0];
+                [enc setBuffer:lw.rel_proj.buf offset:lw.rel_proj.offset atIndex:1];
+                [enc setBuffer:buf_rel_table_ offset:0 atIndex:2];
+                [enc setBytes:&total_rows length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(16u, (total_rows + 31u) / 32u, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            barrier();
+
+            RelAttnParams rap{
+                M, start_pos, kv_cap, visit.local ? 1u : 0u,
+                visit.local ? static_cast<uint32_t>(weights.cfg.window) : 0u,
+                16u, q_stride, gate_offset, sink_offset,
+                1.0f / std::sqrt(128.0f)
+            };
+            [enc setComputePipelineState:pso_rel_attn_prefill_amx_];
+            [enc setBuffer:buf_q_f32_ offset:0 atIndex:0];
+            [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:1];
+            [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:2];
+            [enc setBuffer:buf_rel_table_ offset:0 atIndex:3];
+            [enc setBuffer:buf_q_proj_ offset:0 atIndex:4];
+            [enc setBuffer:buf_attn_out_ offset:0 atIndex:5];
+            [enc setBytes:&rap length:sizeof(rap) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, 24, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            // ----- Output Projection (WO): Zero-Bubble MTLSharedEvent Split -----
+            uint32_t wo_m_gpu = do_dense_sme ? split_m_gpu(hetero_prefill.dense_wo_gpu_pct) : M;
+            uint32_t wo_m_sme = M - wo_m_gpu;
+            if (wo_m_sme > 0u) {
+                uint64_t ev_ready = split_signal();
+                if (wo_m_gpu > 0u) {
+                    encode_linear(enc, buf_attn_out_, 0, false, lw.wo, nil, 0, false, buf_wo_out_, 0, false, wo_m_gpu, D, 3072u);
+                }
+                if (boundary) {
+                    blit_copy(buf_partial_bf16_, buf_res_blocks_[num_blocks], act_bytes);
+                    num_blocks++;
+                }
+                uint64_t ev_done = split_wait();
+                host_steps.push_back({visit.layer, 1, wo_m_gpu, wo_m_sme, D, ev_ready, ev_done});
+            } else {
+                encode_linear(enc, buf_attn_out_, 0, false, lw.wo, nil, 0, false, buf_wo_out_, 0, false, M, D, 3072u);
+                if (boundary) {
+                    blit_copy(buf_partial_bf16_, buf_res_blocks_[num_blocks], act_bytes);
+                    num_blocks++;
+                }
+                barrier();
+            }
+
+            // ----- Attn ShortConv + Residual Add + FFN Input Mix -----
+            bool partial_is_f32 = false;
+            if (boundary) {
+                encode_short_conv(enc, buf_wo_out_, 0, D, 0, lw.attn_sconv_w, seq.conv_attn[vi],
+                                  seq.win_attn[vi], false, buf_partial_bf16_, 0, M, D);
+                partial_is_f32 = false;
+            } else {
+                ShortConvParams scp{M, D, D, 0u, 0u, 0u, 0u, 0u};
+                [enc setComputePipelineState:pso_short_conv_add_f32_prefill_];
+                [enc setBuffer:buf_wo_out_ offset:0 atIndex:0];
+                [enc setBuffer:lw.attn_sconv_w.buf offset:lw.attn_sconv_w.offset atIndex:1];
+                [enc setBuffer:seq.conv_attn[vi] offset:0 atIndex:2];
+                [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:3];
+                [enc setBuffer:buf_partial_f32_ offset:0 atIndex:4];
+                [enc setBytes:&scp length:sizeof(scp) atIndex:5];
+                [enc dispatchThreads:MTLSizeMake(D, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                barrier();
+
+                [enc setComputePipelineState:pso_short_conv_commit_];
+                [enc setBuffer:buf_wo_out_ offset:0 atIndex:0];
+                [enc setBuffer:seq.conv_attn[vi] offset:0 atIndex:1];
+                [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                partial_is_f32 = true;
+            }
+            barrier();
+
+            {
+                id<MTLBuffer> srcs[5];
+                for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
+                srcs[num_blocks] = partial_is_f32 ? buf_partial_f32_ : buf_partial_bf16_;
+                uint32_t nsrc = static_cast<uint32_t>(num_blocks + 1);
+                uint32_t f32_mask = partial_is_f32 ? (1u << num_blocks) : 0u;
+
+                if (!has_msg) {
+                    dispatch_mix(srcs, nsrc, f32_mask, lw.mlp_query, 1, true,
+                                 &lw.mlp_norm, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
+                } else {
+                    dispatch_mix(srcs, nsrc, f32_mask, lw.mlp_query, 1, false,
+                                 nullptr, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
+                    barrier();
+                    encode_controller(enc, lw.ctrl[3],
+                                      buf_mix_f32_, D, 0,
+                                      buf_msg_f32_, 3u * D,
+                                      lw.mlp_norm, buf_ffn_in_, M, 0, conc);
+                }
+            }
+            barrier();
+
+            // ----- MoE NVFP4: Zero-Bubble MTLSharedEvent Split (GPU indirect + CPU SME2!) -----
+            if (sme2_avail && lw.w13.is_nvfp4) {
+                uint32_t w13_pct = static_cast<uint32_t>(std::clamp(hetero_prefill.moe_w13_gpu_pct, 0, 100));
+                uint32_t w2_pct  = static_cast<uint32_t>(std::clamp(hetero_prefill.moe_w2_gpu_pct, 0, 100));
+                RouterParams rp{M, 36u, 36u, weights.cfg.route_scale, w13_pct, w2_pct};
+
+                encode_linear(enc, buf_ffn_in_, 0, false, lw.router_w, nil, 0, false,
+                              buf_router_logits_, 0, true, M, 128u, 2304u);
+                uint32_t W1 = 2304u;
+                [enc setComputePipelineState:pso_nvfp4_quant_act_];
+                [enc setBuffer:buf_ffn_in_ offset:0 atIndex:0];
+                [enc setBuffer:buf_act_q_ offset:0 atIndex:1];
+                [enc setBuffer:buf_act_amax_ offset:0 atIndex:2];
+                [enc setBytes:&W1 length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(160, 1, 1)];
+                barrier();
+
+                [enc setComputePipelineState:pso_moe_topk_parallel_];
+                [enc setBuffer:buf_router_logits_ offset:0 atIndex:0];
+                [enc setBuffer:lw.router_bias.buf offset:lw.router_bias.offset atIndex:1];
+                [enc setBuffer:buf_route_table_ offset:0 atIndex:2];
+                [enc setBytes:&rp length:sizeof(rp) atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(M, 128u), 1, 1)];
+                barrier();
+
+                [enc setComputePipelineState:pso_moe_group_bucket_];
+                [enc setBuffer:buf_route_table_ offset:0 atIndex:0];
+                [enc setBytes:&rp length:sizeof(rp) atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake(128, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                barrier();
+
+                [enc setComputePipelineState:pso_moe_build_worklist_];
+                [enc setBuffer:buf_route_table_ offset:0 atIndex:0];
+                [enc setBuffer:buf_ind_w13_ offset:0 atIndex:1];
+                [enc setBuffer:buf_ind_w2_ offset:0 atIndex:2];
+                [enc setBytes:&rp length:sizeof(rp) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                // Wave 3: W13 NVFP4 — signal CPU right as GPU starts indirect dispatch [0..gpu_tiles_w13)!
+                uint64_t ev_w13_ready = split_signal();
+                {
+                    MoEQuantParams qp1{2304u, 2304u, lw.w13.outer_denom, weights.cfg.gate_cap, weights.cfg.up_cap};
+                    [enc setComputePipelineState:pso_moe_w13_nvfp4_prefill_];
+                    [enc setBuffer:buf_act_q_ offset:0 atIndex:0];
+                    [enc setBuffer:buf_act_amax_ offset:0 atIndex:1];
+                    [enc setBuffer:lw.w13.weight.buf offset:lw.w13.weight.offset atIndex:2];
+                    [enc setBuffer:lw.w13.scales.buf offset:lw.w13.scales.offset atIndex:3];
+                    [enc setBuffer:lw.w13.amax.buf offset:lw.w13.amax.offset atIndex:4];
+                    [enc setBuffer:buf_route_table_ offset:0 atIndex:5];
+                    [enc setBuffer:buf_moe_mid_ offset:0 atIndex:6];
+                    [enc setBytes:&qp1 length:sizeof(qp1) atIndex:7];
+                    [enc dispatchThreadgroupsWithIndirectBuffer:buf_ind_w13_
+                                           indirectBufferOffset:0
+                                          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+                uint64_t ev_w13_done = split_wait();
+                host_steps.push_back({visit.layer, 2, 0u, 0u, 0u, ev_w13_ready, ev_w13_done});
+
+                // Wave 4: Quantize mid activations (W=1152)
+                uint32_t W2 = 1152u;
+                [enc setComputePipelineState:pso_nvfp4_quant_act_];
+                [enc setBuffer:buf_moe_mid_ offset:0 atIndex:0];
+                [enc setBuffer:buf_mid_q_ offset:0 atIndex:1];
+                [enc setBuffer:buf_mid_amax_ offset:0 atIndex:2];
+                [enc setBytes:&W2 length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(M * 8u, 1, 1) threadsPerThreadgroup:MTLSizeMake(96, 1, 1)];
+
+                // Wave 5: W2 NVFP4 — signal CPU right as GPU starts indirect dispatch [0..gpu_tiles_w2)!
+                uint64_t ev_w2_ready = split_signal();
+                {
+                    MoEQuantParams qp2{1152u, 2304u, lw.w2.outer_denom, 0.0f, 0.0f};
+                    [enc setComputePipelineState:pso_moe_w2_nvfp4_prefill_];
+                    [enc setBuffer:buf_mid_q_ offset:0 atIndex:0];
+                    [enc setBuffer:buf_mid_amax_ offset:0 atIndex:1];
+                    [enc setBuffer:lw.w2.weight.buf offset:lw.w2.weight.offset atIndex:2];
+                    [enc setBuffer:lw.w2.scales.buf offset:lw.w2.scales.offset atIndex:3];
+                    [enc setBuffer:lw.w2.amax.buf offset:lw.w2.amax.offset atIndex:4];
+                    [enc setBuffer:buf_route_table_ offset:0 atIndex:5];
+                    [enc setBuffer:buf_moe_down_ offset:0 atIndex:6];
+                    [enc setBytes:&qp2 length:sizeof(qp2) atIndex:7];
+                    [enc dispatchThreadgroupsWithIndirectBuffer:buf_ind_w2_
+                                           indirectBufferOffset:0
+                                          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+                uint64_t ev_w2_done = split_wait();
+                host_steps.push_back({visit.layer, 3, 0u, 0u, 0u, ev_w2_ready, ev_w2_done});
+
+                [enc setComputePipelineState:pso_moe_reduce_];
+                [enc setBuffer:buf_moe_down_ offset:0 atIndex:0];
+                [enc setBuffer:buf_ffn_out_ offset:0 atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(2304, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                barrier();
+            } else {
+                encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, M, true, conc);
+                barrier();
+            }
+
+            // ----- MLP ShortConv + Residual Add + Commit -----
+            ShortConvParams scp{M, D, D, 0u, partial_is_f32 ? 1u : 0u, 0u, 0u, 0u};
+            [enc setComputePipelineState:pso_short_conv_add_bf16_prefill_];
+            [enc setBuffer:buf_ffn_out_ offset:0 atIndex:0];
+            [enc setBuffer:lw.mlp_sconv_w.buf offset:lw.mlp_sconv_w.offset atIndex:1];
+            [enc setBuffer:seq.conv_mlp[vi] offset:0 atIndex:2];
+            [enc setBuffer:(partial_is_f32 ? buf_partial_f32_ : buf_partial_bf16_) offset:0 atIndex:3];
+            [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:4];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(D, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
+
+            [enc setComputePipelineState:pso_short_conv_commit_];
+            [enc setBuffer:buf_ffn_out_ offset:0 atIndex:0];
+            [enc setBuffer:seq.conv_mlp[vi] offset:0 atIndex:1];
+            [enc setBytes:&scp length:sizeof(scp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
+        }
+
+        // ----- Final Output Mix + Norm + Unembed + Argmax -----
+        if (capture_taps || logits_mode != LogitsMode::None) {
+            id<MTLBuffer> srcs[5];
+            for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
+            srcs[num_blocks] = buf_partial_bf16_;
+            dispatch_mix(srcs, static_cast<uint32_t>(num_blocks + 1), 0u, weights.output_query, 1, true,
+                         &weights.output_norm, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
+            barrier();
+        }
+        if (capture_taps) {
+            blit_copy(buf_ffn_in_, buf_taps_[3], act_bytes);
+        }
+        uint32_t V = weights.cfg.unpadded_vocab;
+        if (logits_mode == LogitsMode::LastOnly) {
+            encode_linear(enc, buf_ffn_in_, size_t(M - 1u) * D * 2u, false, weights.unembed, nil, 0, false,
+                          buf_logits_, 0, true, 1, V, D, weights.cfg.logit_cap);
+            barrier();
+            [enc setComputePipelineState:pso_argmax_];
+            [enc setBuffer:buf_logits_ offset:0 atIndex:0];
+            [enc setBuffer:buf_argmax_ offset:0 atIndex:1];
+            [enc setBytes:&V length:4 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        } else if (logits_mode == LogitsMode::All) {
+            encode_linear(enc, buf_ffn_in_, 0, false, weights.unembed, nil, 0, false,
+                          buf_logits_, 0, true, M, V, D, weights.cfg.logit_cap);
+            barrier();
+            [enc setComputePipelineState:pso_argmax_];
+            [enc setBuffer:buf_logits_ offset:0 atIndex:0];
+            [enc setBuffer:buf_argmax_ offset:0 atIndex:1];
+            [enc setBytes:&V length:4 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        }
+        [enc endEncoding];
+
+        // Commit ONE single pipelined GPU command buffer, then service all SME2 steps in lockstep!
+        [cb commit];
+
+        const MoERouteTableHost* tbl = reinterpret_cast<const MoERouteTableHost*>(buf_route_table_.contents);
+        auto wait_gpu_ev = [&](uint64_t target) -> bool {
+            uint32_t spins = 0u;
+            while (hetero_ev_.signaledValue < target) {
+                __builtin_arm_yield();
+                if ((++spins & 4095u) == 0u) {
+                    if (cb.status == MTLCommandBufferStatusError || cb.status == MTLCommandBufferStatusCompleted) {
+                        return false;
+                    }
+                    if (spins > 65536u) sched_yield();
+                }
+            }
+            return true;
+        };
+
+        for (const auto& step : host_steps) {
+            double tw0 = now_ms();
+            if (!wait_gpu_ev(step.wait_val)) break;
+            double ts0 = now_ms();
+            const auto& lw = weights.layers[step.layer];
+            if (step.kind == 0) {
+                const uint16_t* x_hi = reinterpret_cast<const uint16_t*>(buf_norm_in_[0].contents) + size_t(step.m_gpu) * D;
+                const uint16_t* w_bf = reinterpret_cast<const uint16_t*>(
+                    reinterpret_cast<const uint8_t*>(lw.fused_q_proj.buf.contents) + lw.fused_q_proj.offset);
+                uint16_t* y_hi = reinterpret_cast<uint16_t*>(buf_q_proj_.contents) + size_t(step.m_gpu) * step.q_stride;
+                hetero_prefill.run_sme2_bf16_gemm(x_hi, w_bf, y_hi, step.m_sme, step.q_stride, D);
+                double ts1 = now_ms();
+                hetero_ev_.signaledValue = step.sig_val;
+                hetero_prefill.stats.qkv_wait_ms += (ts0 - tw0);
+                hetero_prefill.stats.qkv_sme_ms  += (ts1 - ts0);
+            } else if (step.kind == 1) {
+                const uint16_t* x_hi = reinterpret_cast<const uint16_t*>(buf_attn_out_.contents) + size_t(step.m_gpu) * 3072u;
+                const uint16_t* w_bf = reinterpret_cast<const uint16_t*>(
+                    reinterpret_cast<const uint8_t*>(lw.wo.buf.contents) + lw.wo.offset);
+                uint16_t* y_hi = reinterpret_cast<uint16_t*>(buf_wo_out_.contents) + size_t(step.m_gpu) * D;
+                hetero_prefill.run_sme2_bf16_gemm(x_hi, w_bf, y_hi, step.m_sme, D, 3072u);
+                double ts1 = now_ms();
+                hetero_ev_.signaledValue = step.sig_val;
+                hetero_prefill.stats.wo_wait_ms += (ts0 - tw0);
+                hetero_prefill.stats.wo_sme_ms  += (ts1 - ts0);
+            } else if (step.kind == 2) {
+                uint32_t gt = tbl->gpu_tiles_w13;
+                uint32_t tot = tbl->num_work_tiles;
+                if (gt < tot) {
+                    hetero_prefill.run_sme2_moe_w13(
+                        lw, buf_act_q_.contents, reinterpret_cast<const float*>(buf_act_amax_.contents),
+                        tbl, gt, tot,
+                        reinterpret_cast<uint16_t*>(buf_moe_mid_.contents),
+                        weights.cfg.gate_cap, weights.cfg.up_cap);
+                }
+                double ts1 = now_ms();
+                hetero_ev_.signaledValue = step.sig_val;
+                hetero_prefill.stats.w13_wait_ms += (ts0 - tw0);
+                hetero_prefill.stats.w13_sme_ms  += (ts1 - ts0);
+            } else {
+                uint32_t gt = tbl->gpu_tiles_w2;
+                uint32_t tot = tbl->num_work_tiles;
+                if (gt < tot) {
+                    hetero_prefill.run_sme2_moe_w2(
+                        lw, buf_mid_q_.contents, reinterpret_cast<const float*>(buf_mid_amax_.contents),
+                        tbl, gt, tot,
+                        reinterpret_cast<float*>(buf_moe_down_.contents));
+                }
+                double ts1 = now_ms();
+                hetero_ev_.signaledValue = step.sig_val;
+                hetero_prefill.stats.w2_wait_ms += (ts0 - tw0);
+                hetero_prefill.stats.w2_sme_ms  += (ts1 - ts0);
+            }
+        }
+
+        double tf0 = now_ms();
+        [cb waitUntilCompleted];
+        hetero_prefill.stats.final_gpu_wait_ms += (now_ms() - tf0);
+    }
+
+    seq.pos += static_cast<int>(M);
+    seq.cached_tokens.insert(seq.cached_tokens.end(), tokens.begin(), tokens.end());
+
+    if (capture_taps && weights.draft.loaded) {
+        size_t old_sz = seq.pending_taps.size();
+        seq.pending_taps.resize(old_sz + size_t(M) * 4u * D);
+        for (uint32_t t = 0; t < M; ++t) {
+            for (int tp = 0; tp < 4; ++tp) {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(buf_taps_[tp].contents) + size_t(t) * D;
+                uint16_t* dst = seq.pending_taps.data() + old_sz + (size_t(t) * 4u + tp) * D;
+                std::memcpy(dst, src, D * 2u);
+            }
+        }
+        seq.pending_count += static_cast<int>(M);
+    }
+
+    if (logits_mode == LogitsMode::None) {
+        return {};
+    }
+
+    const uint32_t out_rows = (logits_mode == LogitsMode::LastOnly) ? 1u : M;
+    std::vector<int32_t> out(out_rows);
+    std::memcpy(out.data(), buf_argmax_.contents, out_rows * sizeof(int32_t));
+
+    if (last_logits_out) {
+        uint32_t V = weights.cfg.unpadded_vocab;
+        last_logits_out->resize(V);
+        const float* lp = reinterpret_cast<const float*>(buf_logits_.contents) + size_t(out_rows - 1u) * V;
+        std::memcpy(last_logits_out->data(), lp, V * sizeof(float));
+    }
     return out;
 }
 

@@ -34,6 +34,7 @@ static void print_usage(const char* prog) {
            "  --metal <path>        Path to kernels.metal\n"
            "  --stream              Stream tokens as generated\n"
            "  --dump-ids            Print prompt and generated token IDs\n"
+           "  --hetero              Enable heterogeneous prefill (Metal GPU + ARMv9 SME2 CPU)\n"
            "  --trace <path.json>   Dump HW GPU Perfetto/chrome://tracing JSON for first decode/prefill step\n",
            prog);
 }
@@ -58,6 +59,7 @@ int main(int argc, char** argv) {
     SamplingParams sampling;
     bool stream = false;
     bool dump_ids = false;
+    bool use_hetero = false;
     std::string trace_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -86,6 +88,7 @@ int main(int argc, char** argv) {
         else if (a == "--metal" && i + 1 < argc) { metal_path = argv[++i]; }
         else if (a == "--stream") { stream = true; }
         else if (a == "--dump-ids") { dump_ids = true; }
+        else if (a == "--hetero") { use_hetero = true; }
         else if (a == "--trace" && i + 1 < argc) { trace_path = argv[++i]; }
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
     }
@@ -103,6 +106,9 @@ int main(int argc, char** argv) {
     if (!engine.init(manifest, blobs, metal_path, use_spec, max_seq)) {
         fprintf(stderr, "Engine initialization failed.\n");
         return 1;
+    }
+    if (use_hetero) {
+        engine.enable_hetero_prefill(true, true);
     }
 
     if (serve_mode) {

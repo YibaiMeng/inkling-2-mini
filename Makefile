@@ -1,12 +1,12 @@
 CXX := clang++
-CXXFLAGS := -O3 -std=c++20 -Wall -Wextra -Wshadow -Wno-unused-parameter -Werror -fobjc-arc -march=native
+CXXFLAGS := -O3 -std=c++20 -Wall -Wextra -Wshadow -Wno-unused-parameter -Werror -fobjc-arc -mcpu=apple-m4
 LDFLAGS := -framework Metal -framework Foundation
 
 BUILD_DIR := build
 SRC_DIR := src
 
-SRCS := $(SRC_DIR)/tokenizer.mm $(SRC_DIR)/model_weights.mm $(SRC_DIR)/prefix_cache.mm $(SRC_DIR)/engine.mm $(SRC_DIR)/http_server.mm $(SRC_DIR)/main.mm
-HDRS := $(SRC_DIR)/json_lite.h $(SRC_DIR)/tokenizer.h $(SRC_DIR)/model_weights.h $(SRC_DIR)/prefix_cache.h $(SRC_DIR)/engine.h $(SRC_DIR)/http_server.h
+SRCS := $(SRC_DIR)/tokenizer.mm $(SRC_DIR)/model_weights.mm $(SRC_DIR)/prefix_cache.mm $(SRC_DIR)/hetero_prefill.mm $(SRC_DIR)/engine.mm $(SRC_DIR)/http_server.mm $(SRC_DIR)/main.mm
+HDRS := $(SRC_DIR)/json_lite.h $(SRC_DIR)/tokenizer.h $(SRC_DIR)/model_weights.h $(SRC_DIR)/prefix_cache.h $(SRC_DIR)/hetero_prefill.h $(SRC_DIR)/engine.h $(SRC_DIR)/http_server.h
 OBJS := $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/%.o,$(SRCS))
 
 .PHONY: all clean lint format
@@ -25,7 +25,7 @@ $(BUILD_DIR)/inkling: $(OBJS)
 lint:
 	@echo "Running Clang static analyzer..."
 	@for f in $(SRCS); do \
-		$(CXX) --analyze -Xanalyzer -analyzer-output=text -std=c++20 -Wall -Wextra -Wshadow -Wno-unused-parameter -fobjc-arc $$f -o /dev/null || exit 1; \
+		$(CXX) --analyze -Xanalyzer -analyzer-output=text -std=c++20 -Wall -Wextra -Wshadow -Wno-unused-parameter -fobjc-arc -mcpu=apple-m4 $$f -o /dev/null || exit 1; \
 	done
 	@echo "Static analysis passed cleanly."
 
