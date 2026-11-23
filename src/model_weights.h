@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct TensorRef {
@@ -167,9 +168,19 @@ public:
                                    const std::string& manifest_path,
                                    const std::string& blobs_dir,
                                    bool load_draft = true);
+
+    bool load_from_hf_dir(id<MTLDevice> device,
+                          const std::string& hf_dir,
+                          bool load_draft = true);
     ~InklingWeights();
 
 private:
+    bool load_from_sources(id<MTLDevice> device,
+                           const std::unordered_map<std::string, std::string>& config_blobs,
+                           const std::vector<std::string>& tensor_files,
+                           const std::vector<std::string>& draft_tensor_files,
+                           bool load_draft);
+
     std::vector<MappedBlob> mapped_blobs_;
     std::vector<id<MTLBuffer>> owned_buffers_;
 };

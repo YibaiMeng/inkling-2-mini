@@ -96,6 +96,13 @@ public:
               bool load_draft = true,
               int max_seq = 262144);
 
+    bool init_from_hf(const std::string& hf_dir,
+                      const std::string& metal_path,
+                      bool load_draft = true,
+                      int max_seq = 262144) {
+        return init(hf_dir, "", metal_path, load_draft, max_seq);
+    }
+
     SequenceState create_sequence(int max_global_seq = 262144);
     bool ensure_global_capacity(SequenceState& seq, int needed_tokens);
     void reset_sequence(SequenceState& seq);

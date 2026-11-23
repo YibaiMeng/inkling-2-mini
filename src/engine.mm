@@ -207,7 +207,10 @@ bool InklingEngine::init(const std::string& manifest_path,
 
     double t_metal = now_ms();
 
-    if (!weights.load_from_ollama_manifest(device, manifest_path, blobs_dir, load_draft)) {
+    const bool loaded = blobs_dir.empty()
+        ? weights.load_from_hf_dir(device, manifest_path, load_draft)
+        : weights.load_from_ollama_manifest(device, manifest_path, blobs_dir, load_draft);
+    if (!loaded) {
         return false;
     }
     double t_weights = now_ms();

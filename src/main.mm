@@ -29,8 +29,9 @@ static void print_usage(const char* prog) {
            "  --temp <T>            Sampling temperature (default: 0.0 greedy)\n"
            "  --top-p <P>           Nucleus sampling top-p (default: 1.0)\n"
            "  --seed <S>            PRNG seed for sampling (default: 42)\n"
-           "  --manifest <path>     Ollama manifest path\n"
-           "  --blobs <dir>         Ollama blobs directory\n"
+           "  --model-dir <dir>     Load from standard Hugging Face directory (config.json, tokenizer.json, *.safetensors)\n"
+           "  --manifest <path>     Ollama manifest path (used when --model-dir is not set)\n"
+           "  --blobs <dir>         Ollama blobs directory (used when --model-dir is not set)\n"
            "  --metal <path>        Path to kernels.metal\n"
            "  --stream              Stream tokens as generated\n"
            "  --dump-ids            Print prompt and generated token IDs\n"
@@ -42,6 +43,7 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     const char* home_env = getenv("HOME");
     std::string home = home_env ? home_env : "";
+    std::string model_dir;
     std::string manifest = home + "/.ollama/models/manifests/registry.ollama.ai/library/inkling-2-mini/26b-a5b-nvfp4";
     std::string blobs = home + "/.ollama/models/blobs";
     std::string metal_path = "src/kernels.metal";
@@ -83,6 +85,7 @@ int main(int argc, char** argv) {
         else if (a == "--temp" && i + 1 < argc) { sampling.temperature = static_cast<float>(atof(argv[++i])); }
         else if (a == "--top-p" && i + 1 < argc) { sampling.top_p = static_cast<float>(atof(argv[++i])); }
         else if (a == "--seed" && i + 1 < argc) { sampling.seed = static_cast<uint64_t>(strtoull(argv[++i], nullptr, 10)); }
+        else if ((a == "--model-dir" || a == "--hf-dir") && i + 1 < argc) { model_dir = argv[++i]; }
         else if (a == "--manifest" && i + 1 < argc) { manifest = argv[++i]; }
         else if (a == "--blobs" && i + 1 < argc) { blobs = argv[++i]; }
         else if (a == "--metal" && i + 1 < argc) { metal_path = argv[++i]; }
@@ -103,7 +106,10 @@ int main(int argc, char** argv) {
     }
 
     InklingEngine engine;
-    if (!engine.init(manifest, blobs, metal_path, use_spec, max_seq)) {
+    const bool init_ok = model_dir.empty()
+        ? engine.init(manifest, blobs, metal_path, use_spec, max_seq)
+        : engine.init_from_hf(model_dir, metal_path, use_spec, max_seq);
+    if (!init_ok) {
         fprintf(stderr, "Engine initialization failed.\n");
         return 1;
     }

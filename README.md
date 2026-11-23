@@ -78,6 +78,12 @@ make format
 
 # OpenAI Chat Completions-compatible HTTP server (DSpark speculative on by default!)
 ./build/inkling --serve --host 127.0.0.1 --port 8080
+
+# Heterogeneous Metal GPU + ARMv9 SME2 prefill (+13-16% faster prefill, +0 MB extra RAM)
+./build/inkling --spec --hetero --max-tokens 256 --prompt "..."
+
+# Load directly from a standard Hugging Face model directory (config.json, tokenizer.json, *.safetensors)
+./build/inkling --model-dir /path/to/inkling-2-mini-hf --spec --max-tokens 256
 ```
 
 ### OpenAI-Compatible API (`--serve`)
@@ -97,4 +103,4 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-By default, weights are loaded directly from `~/.ollama/models/manifests/registry.ollama.ai/library/inkling-2-mini/26b-a5b-nvfp4` and `~/.ollama/models/blobs` (override with `--manifest` and `--blobs`).
+By default, weights are loaded directly from `~/.ollama/models/manifests/registry.ollama.ai/library/inkling-2-mini/26b-a5b-nvfp4` and `~/.ollama/models/blobs` (override with `--manifest` and `--blobs`), or pass `--model-dir <dir>` to load directly from a standard Hugging Face directory (`config.json`, `tokenizer.json`, `model.safetensors.index.json` / `*.safetensors`, and optional `draft/` subfolder).

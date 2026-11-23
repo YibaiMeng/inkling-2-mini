@@ -3,9 +3,11 @@
 #include "model_weights.h"
 #include "json_lite.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <sstream>
@@ -13,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 struct RawTensorInfo {
     std::string blob_path;
@@ -41,7 +44,9 @@ InklingWeights::~InklingWeights() {
 }
 
 static bool parse_safetensors_header(const std::string& path,
-                                     std::unordered_map<std::string, RawTensorInfo>& out) {
+                                     std::unordered_map<std::string, RawTensorInfo>& out,
+                                     bool load_draft = true,
+                                     const std::string& auto_prefix = "") {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     uint64_t hlen = 0;
@@ -53,6 +58,12 @@ static bool parse_safetensors_header(const std::string& path,
     json_lite::Value root = json_lite::parse(hdr);
     for (const auto& kv : root.as_object()) {
         if (kv.first == "__metadata__") continue;
+        std::string tname = kv.first;
+        if (!auto_prefix.empty() && tname.rfind(auto_prefix, 0) != 0) {
+            tname = auto_prefix + tname;
+        }
+        if (tname.rfind("model.visual.", 0) == 0) continue;
+        if (!load_draft && tname.rfind("draft.", 0) == 0) continue;
         const auto& obj = kv.second;
         RawTensorInfo info;
         info.blob_path = path;
@@ -63,9 +74,61 @@ static bool parse_safetensors_header(const std::string& path,
         size_t end = static_cast<size_t>(offs[1].as_i64());
         info.data_offset = 8 + static_cast<size_t>(hlen) + start;
         info.nbytes = end - start;
-        out.emplace(kv.first, std::move(info));
+        out.emplace(std::move(tname), std::move(info));
     }
     return true;
+}
+
+static bool file_exists(const std::string& path) {
+    struct stat st;
+    return (stat(path.c_str(), &st) == 0) && S_ISREG(st.st_mode);
+}
+
+static bool dir_exists(const std::string& path) {
+    struct stat st;
+    return (stat(path.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+}
+
+static bool collect_hf_safetensors(const std::string& dir,
+                                   bool load_draft,
+                                   std::vector<std::string>& out_files) {
+    std::string idx_path = dir + "/model.safetensors.index.json";
+    if (file_exists(idx_path)) {
+        std::ifstream ifs(idx_path, std::ios::binary);
+        if (!ifs) return false;
+        std::ostringstream oss;
+        oss << ifs.rdbuf();
+        json_lite::Value idx = json_lite::parse(oss.str());
+        const auto* wm = idx.get("weight_map");
+        if (!wm || !wm->is_object()) return false;
+        std::unordered_set<std::string> seen;
+        for (const auto& kv : wm->as_object()) {
+            const std::string& tname = kv.first;
+            if (tname.rfind("model.visual.", 0) == 0) continue;
+            if (!load_draft && tname.rfind("draft.", 0) == 0) continue;
+            const std::string& rel = kv.second.as_string();
+            if (seen.insert(rel).second) {
+                out_files.push_back(dir + "/" + rel);
+            }
+        }
+        std::sort(out_files.begin(), out_files.end());
+        return !out_files.empty();
+    }
+
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) return false;
+    while (struct dirent* ent = readdir(dp)) {
+        std::string name = ent->d_name;
+        const std::string suffix = ".safetensors";
+        if (name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            std::string full = dir + "/" + name;
+            if (file_exists(full)) out_files.push_back(std::move(full));
+        }
+    }
+    closedir(dp);
+    std::sort(out_files.begin(), out_files.end());
+    return !out_files.empty();
 }
 
 static bool read_raw_bytes(const RawTensorInfo& info, void* dst) {
@@ -95,7 +158,6 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
     json_lite::Value manifest = json_lite::parse(oss.str());
 
     std::unordered_map<std::string, std::string> config_blobs;
-    std::unordered_map<std::string, RawTensorInfo> raw_tensors;
     std::vector<std::string> tensor_blobs_to_parse;
 
     for (const auto& layer : manifest.at("layers").as_array()) {
@@ -116,17 +178,70 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
             tensor_blobs_to_parse.push_back(bpath);
         }
     }
+    return load_from_sources(device, config_blobs, tensor_blobs_to_parse, {}, load_draft);
+}
 
-    if (config_blobs.count("tokenizer.json")) {
-        tokenizer_path = config_blobs["tokenizer.json"];
+bool InklingWeights::load_from_hf_dir(id<MTLDevice> device,
+                                      const std::string& hf_dir_in,
+                                      bool load_draft) {
+    std::string hf_dir = hf_dir_in;
+    while (hf_dir.size() > 1 && hf_dir.back() == '/') hf_dir.pop_back();
+    if (!dir_exists(hf_dir)) {
+        fprintf(stderr, "Hugging Face model directory not found: %s\n", hf_dir.c_str());
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> config_blobs;
+    if (file_exists(hf_dir + "/config.json")) {
+        config_blobs["config.json"] = hf_dir + "/config.json";
+    } else {
+        fprintf(stderr, "Missing config.json in %s\n", hf_dir.c_str());
+        return false;
+    }
+    if (file_exists(hf_dir + "/tokenizer.json")) {
+        config_blobs["tokenizer.json"] = hf_dir + "/tokenizer.json";
+    } else {
+        fprintf(stderr, "Missing tokenizer.json in %s\n", hf_dir.c_str());
+        return false;
+    }
+
+    std::vector<std::string> tensor_files;
+    if (!collect_hf_safetensors(hf_dir, load_draft, tensor_files)) {
+        fprintf(stderr, "No .safetensors files found in %s\n", hf_dir.c_str());
+        return false;
+    }
+
+    std::vector<std::string> draft_tensor_files;
+    if (load_draft) {
+        std::string draft_dir = hf_dir + "/draft";
+        if (file_exists(draft_dir + "/config.json")) {
+            config_blobs["draft/config.json"] = draft_dir + "/config.json";
+        }
+        if (dir_exists(draft_dir)) {
+            collect_hf_safetensors(draft_dir, true, draft_tensor_files);
+        }
+    }
+
+    return load_from_sources(device, config_blobs, tensor_files, draft_tensor_files, load_draft);
+}
+
+bool InklingWeights::load_from_sources(id<MTLDevice> device,
+                                       const std::unordered_map<std::string, std::string>& config_blobs,
+                                       const std::vector<std::string>& tensor_files,
+                                       const std::vector<std::string>& draft_tensor_files,
+                                       bool load_draft) {
+    std::unordered_map<std::string, RawTensorInfo> raw_tensors;
+
+    if (auto it = config_blobs.find("tokenizer.json"); it != config_blobs.end()) {
+        tokenizer_path = it->second;
     }
 
     // Parse config.json
-    if (config_blobs.count("config.json")) {
-        std::ifstream cf(config_blobs["config.json"]);
+    if (auto it = config_blobs.find("config.json"); it != config_blobs.end()) {
+        std::ifstream cf(it->second);
         std::ostringstream coss; coss << cf.rdbuf();
         json_lite::Value cj = json_lite::parse(coss.str());
-        const auto& tc = cj.at("text_config");
+        const auto& tc = cj.get("text_config") ? cj.at("text_config") : cj;
         cfg.num_layers = tc.at("num_hidden_layers").as_int();
         cfg.hidden_size = tc.at("hidden_size").as_int();
         cfg.vocab_size = tc.at("vocab_size").as_int();
@@ -174,40 +289,46 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
 
     // Parse all safetensors headers
     raw_tensors.reserve(1024);
-    for (const auto& bp : tensor_blobs_to_parse) {
-        if (!parse_safetensors_header(bp, raw_tensors)) {
+    for (const auto& bp : tensor_files) {
+        if (!parse_safetensors_header(bp, raw_tensors, load_draft)) {
             fprintf(stderr, "Failed to parse safetensors: %s\n", bp.c_str());
+            return false;
+        }
+    }
+    for (const auto& bp : draft_tensor_files) {
+        if (!parse_safetensors_header(bp, raw_tensors, true, "draft.")) {
+            fprintf(stderr, "Failed to parse draft safetensors: %s\n", bp.c_str());
             return false;
         }
     }
 
     const size_t page_sz = static_cast<size_t>(getpagesize());
-    std::unordered_map<std::string, MappedBlob*> blob_cache;
+    std::unordered_map<std::string, size_t> blob_cache;
 
-    auto mmap_blob = [&](const std::string& path) -> MappedBlob* {
+    auto mmap_blob = [&](const std::string& path) -> id<MTLBuffer> {
         auto it = blob_cache.find(path);
-        if (it != blob_cache.end()) return it->second;
+        if (it != blob_cache.end()) return mapped_blobs_[it->second].buf;
         int fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return nullptr;
+        if (fd < 0) return nil;
         struct stat st;
         fstat(fd, &st);
         size_t fsz = static_cast<size_t>(st.st_size);
         size_t mlen = (fsz + page_sz - 1) & ~(page_sz - 1);
         void* ptr = mmap(nullptr, mlen, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd); // POSIX: mapping stays valid after close! Avoids FD limit!
-        if (ptr == MAP_FAILED) return nullptr;
+        if (ptr == MAP_FAILED) return nil;
         id<MTLBuffer> buf = [device newBufferWithBytesNoCopy:ptr
                                                       length:mlen
                                                      options:MTLResourceStorageModeShared
                                                  deallocator:nil];
         if (!buf) {
             munmap(ptr, mlen);
-            return nullptr;
+            return nil;
         }
+        size_t idx = mapped_blobs_.size();
         mapped_blobs_.push_back({ptr, mlen, buf});
-        MappedBlob* mb = &mapped_blobs_.back();
-        blob_cache[path] = mb;
-        return mb;
+        blob_cache[path] = idx;
+        return buf;
     };
 
     auto get_raw = [&](const std::string& name) -> const RawTensorInfo& {
@@ -219,21 +340,30 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
         return it->second;
     };
 
-    // Zero-copy mmap tensor ref (used for large tensors: experts, embed, unembed, wo, etc.)
-    auto load_mmap_tensor = [&](const std::string& name) -> TensorRef {
-        const auto& info = get_raw(name);
-        MappedBlob* mb = mmap_blob(info.blob_path);
-        if (!mb) { fprintf(stderr, "mmap failed for %s\n", name.c_str()); std::abort(); }
-        return {mb->buf, info.data_offset, info.nbytes, info.shape, info.dtype};
-    };
-
     // Arena buffer for small packed tensors (norms, queries, convs, fused projections)
-    // Allocate a clean 2 GB arena or separate packed buffers per layer so offsets are always 256-byte aligned!
+    // Allocate separate packed buffers per layer so offsets are always 256-byte aligned!
     auto alloc_aligned_buf = [&](size_t nbytes) -> id<MTLBuffer> {
         size_t sz = (nbytes + 255) & ~size_t(255);
         id<MTLBuffer> b = [device newBufferWithLength:sz options:MTLResourceStorageModeShared];
         owned_buffers_.push_back(b);
         return b;
+    };
+
+    // Zero-copy mmap tensor ref (used for large tensors: experts, embed, unembed, wo, etc.).
+    // Falls back to an aligned copy if a multi-tensor HF shard offset is not 16-byte aligned.
+    auto load_mmap_tensor = [&](const std::string& name) -> TensorRef {
+        const auto& info = get_raw(name);
+        if ((info.data_offset & 15u) != 0u) {
+            id<MTLBuffer> b = alloc_aligned_buf(info.nbytes);
+            if (!read_raw_bytes(info, b.contents)) {
+                fprintf(stderr, "read failed for %s\n", name.c_str());
+                std::abort();
+            }
+            return {b, 0, info.nbytes, info.shape, info.dtype};
+        }
+        id<MTLBuffer> buf = mmap_blob(info.blob_path);
+        if (!buf) { fprintf(stderr, "mmap failed for %s\n", name.c_str()); std::abort(); }
+        return {buf, info.data_offset, info.nbytes, info.shape, info.dtype};
     };
 
     // Pack multiple 2D row-major tensors along dim 0 into one contiguous MTLBuffer
@@ -416,7 +546,7 @@ bool InklingWeights::load_from_ollama_manifest(id<MTLDevice> device,
 
     // Load DSpark / DFlash2 draft model weights
     if (load_draft && config_blobs.count("draft/config.json")) {
-        std::ifstream df(config_blobs["draft/config.json"]);
+        std::ifstream df(config_blobs.at("draft/config.json"));
         std::ostringstream doss; doss << df.rdbuf();
         json_lite::Value dj = json_lite::parse(doss.str());
         draft.num_layers = dj.at("num_hidden_layers").as_int();
