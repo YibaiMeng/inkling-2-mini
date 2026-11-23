@@ -238,9 +238,26 @@ bool InklingEngine::init(const std::string& manifest_path,
     buf_msg_f32_     = alloc(MAX_M * 4 * D * 4);
     for (int i = 0; i < 3; ++i) buf_norm_in_[i] = alloc(MAX_M * D * 2);
     buf_ffn_in_      = alloc(MAX_M * D * 2);
-    buf_ctrl_concat_ = alloc(MAX_M * 4608 * 2);
-    buf_ctrl_down_   = alloc(MAX_M * 64 * 4);
-    buf_ctrl_gf_     = alloc(MAX_M * 4608 * 4);
+    for (int i = 0; i < 3; ++i) {
+        buf_ctrl_concat_[i] = alloc(MAX_M * 4608 * 2);
+        buf_ctrl_down_[i]   = alloc(MAX_M * 64 * 4);
+        buf_ctrl_gf_[i]     = alloc(MAX_M * 4608 * 4);
+    }
+
+    if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        id<MTLCounterSet> tsSet = nil;
+        for (id<MTLCounterSet> cs in device.counterSets) {
+            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) { tsSet = cs; break; }
+        }
+        if (tsSet) {
+            MTLCounterSampleBufferDescriptor* cdesc = [MTLCounterSampleBufferDescriptor new];
+            cdesc.counterSet = tsSet;
+            cdesc.storageMode = MTLStorageModeShared;
+            cdesc.sampleCount = 2048;
+            NSError* cerr = nil;
+            trace_csb_ = [device newCounterSampleBufferWithDescriptor:cdesc error:&cerr];
+        }
+    }
 
     buf_q_proj_      = alloc(MAX_M * 8600 * 2);
     buf_k_proj_      = alloc(MAX_M * 1056 * 2);
@@ -501,7 +518,8 @@ void InklingEngine::encode_short_conv(id<MTLComputeCommandEncoder> enc,
                                       id<MTLBuffer> win, bool save_win,
                                       id<MTLBuffer> out, size_t out_off,
                                       uint32_t M, uint32_t C,
-                                      bool is_dynamic, uint32_t dyn_stride, uint32_t dyn_el_off) {
+                                      bool is_dynamic, uint32_t dyn_stride, uint32_t dyn_el_off,
+                                      bool skip_commit) {
     ShortConvParams p{M, C, x_stride, x_el_off, is_dynamic ? 1u : 0u, dyn_stride, dyn_el_off, save_win ? 1u : 0u};
     if (M > 8u && !save_win) {
         [enc setComputePipelineState:pso_short_conv_prefill_];
@@ -512,11 +530,14 @@ void InklingEngine::encode_short_conv(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&p length:sizeof(p) atIndex:4];
         [enc dispatchThreads:MTLSizeMake(C, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-        [enc setComputePipelineState:pso_short_conv_commit_];
-        [enc setBuffer:x offset:x_off atIndex:0];
-        [enc setBuffer:state offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(C, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (!skip_commit) {
+            if (use_concurrent_dispatch) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:pso_short_conv_commit_];
+            [enc setBuffer:x offset:x_off atIndex:0];
+            [enc setBuffer:state offset:0 atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(C, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
         return;
     }
     [enc setComputePipelineState:pso_short_conv_];
@@ -538,7 +559,8 @@ void InklingEngine::rollback_target(SequenceState& seq, int prev_pos, int accept
     uint32_t clen = static_cast<uint32_t>(accepted);
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:
+            (use_concurrent_dispatch ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
         [enc setComputePipelineState:pso_short_conv_rollback_];
         auto rb = [&](id<MTLBuffer> win, id<MTLBuffer> st, uint32_t C) {
             [enc setBuffer:win offset:0 atIndex:0];
@@ -565,32 +587,37 @@ void InklingEngine::encode_controller(id<MTLComputeCommandEncoder> enc,
                                       id<MTLBuffer> msg, uint32_t msg_off,
                                       const TensorRef& norm_w,
                                       id<MTLBuffer> out_bf16,
-                                      uint32_t M) {
+                                      uint32_t M,
+                                      int slot,
+                                      bool concurrent) {
     float eps = weights.cfg.norm_eps;
-    // 1. RMSNorm(inp) || RMSNorm(msg) -> buf_ctrl_concat_ [M, 4608] BF16
+    // 1. RMSNorm(inp) || RMSNorm(msg) -> buf_ctrl_concat_[slot] [M, 4608] BF16
     [enc setComputePipelineState:pso_ctrl_norm_concat_];
     [enc setBuffer:inp offset:0 atIndex:0];
     [enc setBuffer:msg offset:0 atIndex:1];
-    [enc setBuffer:buf_ctrl_concat_ offset:0 atIndex:2];
+    [enc setBuffer:buf_ctrl_concat_[slot] offset:0 atIndex:2];
     [enc setBytes:&inp_stride length:4 atIndex:3];
     [enc setBytes:&inp_off length:4 atIndex:4];
     [enc setBytes:&msg_off length:4 atIndex:5];
     [enc setBytes:&eps length:4 atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+    if (concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // 2. down [64, 4608] -> buf_ctrl_down_ [M, 64] F32
-    encode_linear(enc, buf_ctrl_concat_, 0, false, ctrl.down, nil, 0, false,
-                  buf_ctrl_down_, 0, true, M, 64, 4608);
+    // 2. down [64, 4608] -> buf_ctrl_down_[slot] [M, 64] F32
+    encode_linear(enc, buf_ctrl_concat_[slot], 0, false, ctrl.down, nil, 0, false,
+                  buf_ctrl_down_[slot], 0, true, M, 64, 4608);
+    if (concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // 3. gain_forget [4608, 64] -> buf_ctrl_gf_ [M, 4608] F32
-    encode_linear(enc, buf_ctrl_down_, 0, true, ctrl.gain_forget, nil, 0, false,
-                  buf_ctrl_gf_, 0, true, M, 4608, 64);
+    // 3. gain_forget [4608, 64] -> buf_ctrl_gf_[slot] [M, 4608] F32
+    encode_linear(enc, buf_ctrl_down_[slot], 0, true, ctrl.gain_forget, nil, 0, false,
+                  buf_ctrl_gf_[slot], 0, true, M, 4608, 64);
+    if (concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // 4. Fused mix + RMSNorm -> out_bf16 [M, 2304] BF16
     [enc setComputePipelineState:pso_ctrl_mix_rms_];
     [enc setBuffer:inp offset:0 atIndex:0];
     [enc setBuffer:msg offset:0 atIndex:1];
-    [enc setBuffer:buf_ctrl_gf_ offset:0 atIndex:2];
+    [enc setBuffer:buf_ctrl_gf_[slot] offset:0 atIndex:2];
     [enc setBuffer:norm_w.buf offset:norm_w.offset atIndex:3];
     [enc setBuffer:out_bf16 offset:0 atIndex:4];
     [enc setBytes:&inp_stride length:4 atIndex:5];
@@ -600,23 +627,107 @@ void InklingEngine::encode_controller(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
 }
 
+void InklingEngine::encode_controllers_3way(id<MTLComputeCommandEncoder> enc,
+                                            const LayerWeights& lw,
+                                            id<MTLBuffer> inp, uint32_t inp_stride, bool is_local,
+                                            id<MTLBuffer> msg,
+                                            uint32_t M,
+                                            bool concurrent) {
+    const uint32_t D = weights.cfg.hidden_size;
+    float eps = weights.cfg.norm_eps;
+    if (!concurrent) {
+        for (int c_i = 0; c_i < 3; ++c_i) {
+            uint32_t ioff = is_local ? 0u : (static_cast<uint32_t>(c_i) * D);
+            encode_controller(enc, lw.ctrl[c_i], inp, inp_stride, ioff,
+                              msg, static_cast<uint32_t>(c_i) * D, lw.attn_norm[c_i],
+                              buf_norm_in_[c_i], M, 0, false);
+        }
+        return;
+    }
+    // Wave 1: 3-way concurrent norm_concat
+    [enc setComputePipelineState:pso_ctrl_norm_concat_];
+    for (int c_i = 0; c_i < 3; ++c_i) {
+        uint32_t ioff = is_local ? 0u : (static_cast<uint32_t>(c_i) * D);
+        uint32_t moff = static_cast<uint32_t>(c_i) * D;
+        [enc setBuffer:inp offset:0 atIndex:0];
+        [enc setBuffer:msg offset:0 atIndex:1];
+        [enc setBuffer:buf_ctrl_concat_[c_i] offset:0 atIndex:2];
+        [enc setBytes:&inp_stride length:4 atIndex:3];
+        [enc setBytes:&ioff length:4 atIndex:4];
+        [enc setBytes:&moff length:4 atIndex:5];
+        [enc setBytes:&eps length:4 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Wave 2: 3-way concurrent down [64, 4608]
+    for (int c_i = 0; c_i < 3; ++c_i) {
+        encode_linear(enc, buf_ctrl_concat_[c_i], 0, false, lw.ctrl[c_i].down, nil, 0, false,
+                      buf_ctrl_down_[c_i], 0, true, M, 64, 4608);
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Wave 3: 3-way concurrent gain_forget [4608, 64]
+    for (int c_i = 0; c_i < 3; ++c_i) {
+        encode_linear(enc, buf_ctrl_down_[c_i], 0, true, lw.ctrl[c_i].gain_forget, nil, 0, false,
+                      buf_ctrl_gf_[c_i], 0, true, M, 4608, 64);
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Wave 4: 3-way concurrent mix_rmsnorm -> buf_norm_in_[0..2]
+    [enc setComputePipelineState:pso_ctrl_mix_rms_];
+    for (int c_i = 0; c_i < 3; ++c_i) {
+        uint32_t ioff = is_local ? 0u : (static_cast<uint32_t>(c_i) * D);
+        uint32_t moff = static_cast<uint32_t>(c_i) * D;
+        [enc setBuffer:inp offset:0 atIndex:0];
+        [enc setBuffer:msg offset:0 atIndex:1];
+        [enc setBuffer:buf_ctrl_gf_[c_i] offset:0 atIndex:2];
+        [enc setBuffer:lw.attn_norm[c_i].buf offset:lw.attn_norm[c_i].offset atIndex:3];
+        [enc setBuffer:buf_norm_in_[c_i] offset:0 atIndex:4];
+        [enc setBytes:&inp_stride length:4 atIndex:5];
+        [enc setBytes:&ioff length:4 atIndex:6];
+        [enc setBytes:&moff length:4 atIndex:7];
+        [enc setBytes:&eps length:4 atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+    }
+}
+
 void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
                                const LayerWeights& lw,
                                id<MTLBuffer> ffn_in,
                                id<MTLBuffer> ffn_out,
                                uint32_t M,
-                               bool do_reduce) {
-    // 1a. Parallel Router GEMV/GEMM [128, 2304] -> buf_router_logits_ [M, 128] F32 (~3 us!)
-    encode_linear(enc, ffn_in, 0, false, lw.router_w, nil, 0, false,
-                  buf_router_logits_, 0, true, M, 128, 2304);
-
-    // 1b. Fast Top-8 + unique expert bucketing
-    // Prefill (M > 8): AMX simdgroup_bfloat8x8 kernels -> grid_x = 36 (64 rows/TG)
-    // Decode/Verify (M <= 8): zero-barrier GEMV kernels -> NVFP4 (288, 144), MXFP8 (288, 288)
+                               bool do_reduce,
+                               bool concurrent) {
+    auto barrier = [&]() { if (concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
     const bool use_amx_prefill = (M > 8u);
     uint32_t w13_gx = use_amx_prefill ? 36u : ((M == 1u && lw.w13.is_nvfp4) ? 144u : 288u);
     uint32_t w2_gx  = use_amx_prefill ? 36u : (lw.w2.is_nvfp4 ? 144u : 288u);
     RouterParams rp{M, w13_gx, w2_gx, weights.cfg.route_scale};
+
+    // Wave 1 (CONCURRENT!): Router GEMV/GEMM [128, 2304] AND Activation Quantization both read ffn_in!
+    encode_linear(enc, ffn_in, 0, false, lw.router_w, nil, 0, false,
+                  buf_router_logits_, 0, true, M, 128, 2304);
+
+    if (lw.w13.is_nvfp4) {
+        uint32_t W1 = 2304u;
+        [enc setComputePipelineState:pso_nvfp4_quant_act_];
+        [enc setBuffer:ffn_in offset:0 atIndex:0];
+        [enc setBuffer:buf_act_q_ offset:0 atIndex:1];
+        [enc setBuffer:buf_act_amax_ offset:0 atIndex:2];
+        [enc setBytes:&W1 length:4 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(160, 1, 1)];
+    } else {
+        uint32_t W1 = 2304u;
+        [enc setComputePipelineState:pso_mxfp8_quant_act_];
+        [enc setBuffer:ffn_in offset:0 atIndex:0];
+        [enc setBuffer:buf_act_q_ offset:0 atIndex:1];
+        [enc setBytes:&W1 length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(W1 / 32u, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    barrier();
+
+    // Wave 2: Top-8 + expert bucketing -> buf_route_table_, buf_ind_w13_, buf_ind_w2_
     if (use_amx_prefill) {
         [enc setComputePipelineState:pso_moe_topk_parallel_];
         [enc setBuffer:buf_router_logits_ offset:0 atIndex:0];
@@ -624,11 +735,13 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBuffer:buf_route_table_ offset:0 atIndex:2];
         [enc setBytes:&rp length:sizeof(rp) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(M, 128u), 1, 1)];
+        barrier();
 
         [enc setComputePipelineState:pso_moe_group_bucket_];
         [enc setBuffer:buf_route_table_ offset:0 atIndex:0];
         [enc setBytes:&rp length:sizeof(rp) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake(128, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
 
         [enc setComputePipelineState:pso_moe_build_worklist_];
         [enc setBuffer:buf_route_table_ offset:0 atIndex:0];
@@ -646,18 +759,10 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&rp length:sizeof(rp) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
+    barrier();
 
     if (lw.w13.is_nvfp4) {
-        // 2a. Quantize input activations (exact NVFP4 4-over-6 -> half), W=2304 -> 144 blocks -> 160 threads
-        uint32_t W1 = 2304u;
-        [enc setComputePipelineState:pso_nvfp4_quant_act_];
-        [enc setBuffer:ffn_in offset:0 atIndex:0];
-        [enc setBuffer:buf_act_q_ offset:0 atIndex:1];
-        [enc setBuffer:buf_act_amax_ offset:0 atIndex:2];
-        [enc setBytes:&W1 length:4 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(160, 1, 1)];
-
-        // 2b. Coalesced W13 NVFP4 + Fused Weighted SwiGLU
+        // Wave 3: Coalesced W13 NVFP4 + Fused Weighted SwiGLU
         MoEQuantParams qp1{2304u, 2304u, lw.w13.outer_denom, weights.cfg.gate_cap, weights.cfg.up_cap};
         id<MTLComputePipelineState> w13_pso = use_amx_prefill ? pso_moe_w13_nvfp4_prefill_
                                                               : (M == 1u ? pso_moe_w13_nvfp4_m1_ : pso_moe_w13_nvfp4_);
@@ -673,8 +778,9 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc dispatchThreadgroupsWithIndirectBuffer:buf_ind_w13_
                                indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
 
-        // 3a. Quantize mid activations (W=1152 -> 72 blocks -> 96 threads, M*8 rows)
+        // Wave 4: Quantize mid activations (W=1152)
         uint32_t W2 = 1152u;
         [enc setComputePipelineState:pso_nvfp4_quant_act_];
         [enc setBuffer:buf_moe_mid_ offset:0 atIndex:0];
@@ -682,8 +788,9 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBuffer:buf_mid_amax_ offset:0 atIndex:2];
         [enc setBytes:&W2 length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(M * 8u, 1, 1) threadsPerThreadgroup:MTLSizeMake(96, 1, 1)];
+        barrier();
 
-        // 3b. Coalesced W2 NVFP4
+        // Wave 5: Coalesced W2 NVFP4
         MoEQuantParams qp2{1152u, 2304u, lw.w2.outer_denom, 0.0f, 0.0f};
         [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w2_nvfp4_prefill_ : pso_moe_w2_nvfp4_)];
         [enc setBuffer:buf_mid_q_ offset:0 atIndex:0];
@@ -699,13 +806,6 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
                               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
         // MXFP8 layers (20..23)
-        uint32_t W1 = 2304u;
-        [enc setComputePipelineState:pso_mxfp8_quant_act_];
-        [enc setBuffer:ffn_in offset:0 atIndex:0];
-        [enc setBuffer:buf_act_q_ offset:0 atIndex:1];
-        [enc setBytes:&W1 length:4 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(W1 / 32u, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
         MoEQuantParams qp1{2304u, 2304u, 1.0f, weights.cfg.gate_cap, weights.cfg.up_cap};
         [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w13_mxfp8_prefill_ : pso_moe_w13_mxfp8_)];
         [enc setBuffer:buf_act_q_ offset:0 atIndex:0];
@@ -717,6 +817,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc dispatchThreadgroupsWithIndirectBuffer:buf_ind_w13_
                                indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
 
         uint32_t W2 = 1152u;
         [enc setComputePipelineState:pso_mxfp8_quant_act_];
@@ -724,6 +825,7 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
         [enc setBuffer:buf_mid_q_ offset:0 atIndex:1];
         [enc setBytes:&W2 length:4 atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(W2 / 32u, M * 8u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        barrier();
 
         [enc setComputePipelineState:(use_amx_prefill ? pso_moe_w2_mxfp8_prefill_ : pso_moe_w2_mxfp8_)];
         [enc setBuffer:buf_mid_q_ offset:0 atIndex:0];
@@ -736,8 +838,8 @@ void InklingEngine::encode_moe(id<MTLComputeCommandEncoder> enc,
                               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
-    // 4. Optional standalone reduce (skipped when fused with mlp_sconv + residual add)
     if (do_reduce) {
+        barrier();
         [enc setComputePipelineState:pso_moe_reduce_];
         [enc setBuffer:buf_moe_down_ offset:0 atIndex:0];
         [enc setBuffer:ffn_out offset:0 atIndex:1];
@@ -839,10 +941,51 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
     // Even better: add a small kernel or keep a rollback snapshot of the 11-row window `[s0, s1, s2, x0..x_{M-1}]` per visit inside `short_conv_4tap`!
     // For Milestone 1 (exact target verification), let's first encode the clean, blazing-fast target forward!
 
-    @autoreleasepool {
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    std::string trace_path;
+    if (!next_trace_path_.empty() && trace_csb_ != nil) {
+        trace_path = next_trace_path_;
+        next_trace_path_.clear();
+    }
+    const bool tracing = !trace_path.empty();
+    const bool conc = use_concurrent_dispatch;
+    const MTLDispatchType dtype = conc ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
 
+    struct TracePhase { std::string name; std::string cat; uint32_t idx; };
+    std::vector<TracePhase> trace_phases;
+    if (tracing) trace_phases.reserve(600);
+
+    double cpu_enc_start_ms = 0.0, cpu_commit_ms = 0.0, cpu_done_ms = 0.0;
+    double cb_gpu_start_s = 0.0, cb_gpu_end_s = 0.0, cb_kern_start_s = 0.0;
+
+    @autoreleasepool {
+        cpu_enc_start_ms = now_ms();
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        auto open_phase = [&](const std::string& name, const char* cat) {
+            if (!tracing) {
+                if (!enc) enc = [cb computeCommandEncoderWithDispatchType:dtype];
+                return;
+            }
+            if (enc) [enc endEncoding];
+            uint32_t k = static_cast<uint32_t>(trace_phases.size());
+            if ((k + 1u) * 2u <= 2048u) {
+                MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+                desc.dispatchType = dtype;
+                desc.sampleBufferAttachments[0].sampleBuffer = trace_csb_;
+                desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = k * 2u;
+                desc.sampleBufferAttachments[0].endOfEncoderSampleIndex = k * 2u + 1u;
+                enc = [cb computeCommandEncoderWithDescriptor:desc];
+                trace_phases.push_back({name, cat, k});
+            } else {
+                enc = [cb computeCommandEncoderWithDispatchType:dtype];
+            }
+        };
+        auto barrier = [&]() {
+            if (conc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        };
+
+        open_phase("EmbedRMS", "embed");
         // 0. Embed + EmbedNorm -> buf_partial_bf16_ [M, 2304]
         [enc setComputePipelineState:pso_embed_rms_];
         [enc setBuffer:buf_tok_ids_ offset:0 atIndex:0];
@@ -851,26 +994,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
         [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:3];
         [enc setBytes:&eps length:4 atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
-
-        // Helper to copy [M, 2304] BF16 between GPU buffers via blit (wait: can't blit inside compute encoder!
-        // Use a tiny compute copy or keep ping-pong buffer pointers!)
-        // Even better: ZERO copies for blocks! Just track which buffer holds each block!
-        // Wait: at boundary (layer % 6 == 0):
-        //   visit 0 (L0): saves partial -> block[0]
-        //   visit 6 (L6, pass 0): saves prelude_partial = partial (block[0] stays block[0]!), then boundary saves partial -> block[1]
-        //   visit 12 (L12, pass 0): boundary saves partial -> block[2]
-        //   visit 18 (L6, pass 1): previous = {block[2], partial}; restore state = {block[0], prelude_partial}!
-        //                          then boundary saves prelude_partial -> block[1]
-        //   visit 24 (L12, pass 1): boundary saves partial -> block[2]
-        //   visit 30 (L6, pass 2): previous = {block[2], partial}; restore state = {block[0], prelude_partial}!
-        //                          then boundary saves prelude_partial -> block[1]
-        //   visit 36 (L12, pass 2): boundary saves partial -> block[2]
-        //   visit 42 (L18, pass 0): boundary saves partial -> block[3]
-        //   end: blocks = {block[0..3]}, partial = partial (5 sources total!)
-        //
-        // LOOK HOW CLEAN THAT IS!! We only need a 1-line copy kernel `copy_bf16` (or `add_bf16_bf16` with 0) —
-        // actually let's just end/start blit encoder? No, ending compute encoder breaks nothing and blit on 36KB is 0.5us!
-        // Actually we can do a super fast copy via `buf_res_blocks_`! Let's use blit encoder at the 8 boundaries + 3 taps = 11 tiny blits (total < 10us across all 48 layers!).
+        barrier();
 
         auto blit_copy = [&](id<MTLBuffer> src, id<MTLBuffer> dst, size_t nbytes) {
             uint32_t n4 = static_cast<uint32_t>(nbytes / 8); // bfloat4 = 8 bytes
@@ -910,6 +1034,9 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
             const auto& visit = weights.plan[vi];
             const auto& lw = weights.layers[visit.layer];
             bool boundary = (visit.layer % weights.cfg.residual_block_size == 0);
+            std::string vtag = tracing ? ("v" + std::to_string(vi) + "_L" + std::to_string(visit.layer)) : "";
+
+            open_phase(vtag + "_MixCtrl", "mix_ctrl");
 
             // Handle loop core entry (layer == 6)
             if (visit.layer == weights.cfg.loop_start) {
@@ -917,38 +1044,32 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                     prelude_num_blocks = num_blocks; // 1
                     blit_copy(buf_partial_bf16_, buf_prelude_partial_, act_bytes);
                 } else {
-                    // previous = {blocks[prelude_num_blocks+1 .. num_blocks-1], partial} = {blocks[2], partial}
+                    // previous = {blocks[2], partial}; restore state = prelude
                     blit_copy(buf_res_blocks_[prelude_num_blocks + 1], buf_prev_blocks_[0], act_bytes);
                     blit_copy(buf_partial_bf16_, buf_prev_blocks_[1], act_bytes);
-                    // restore state = prelude
+                    barrier();
                     num_blocks = prelude_num_blocks;
                     blit_copy(buf_prelude_partial_, buf_partial_bf16_, act_bytes);
+                    barrier();
                 }
             }
 
-            // Capture draft tap if requested (taps at visits 5, 23, 41)
+            // Capture draft tap if requested (taps at visits 5, 23, 41) — disjoint dst, overlaps with mix!
             if (capture_taps && tap_idx < 3 && static_cast<int>(vi) == weights.draft.taps[tap_idx]) {
                 blit_copy(buf_partial_bf16_, buf_taps_[tap_idx], act_bytes);
                 tap_idx++;
             }
 
-            // Compute cross-pass messages if pass > 0
+            // Compute cross-pass messages & Attention Input Mix (CONCURRENT when has_msg!)
             bool has_msg = (visit.pass > 0);
-            if (has_msg) {
-                id<MTLBuffer> psrcs[5] = {buf_prev_blocks_[0], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1]};
-                dispatch_mix(psrcs, 2, 0u, lw.msg_queries, 4, false, nullptr, nullptr, nullptr,
-                             buf_msg_f32_, buf_norm_in_[0]);
-            }
-
-            // ----- Attention Input Preparation -----
             if (num_blocks == 0) {
-                // Visit 0 (layer 0, local, pass 0): no mix, just RMSNorm(partial) -> buf_norm_in_[0]
                 [enc setComputePipelineState:pso_rms_bf16_];
                 [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:0];
                 [enc setBuffer:lw.attn_norm[0].buf offset:lw.attn_norm[0].offset atIndex:1];
                 [enc setBuffer:buf_norm_in_[0] offset:0 atIndex:2];
                 [enc setBytes:&eps length:4 atIndex:3];
                 [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+                barrier();
             } else {
                 id<MTLBuffer> srcs[5];
                 for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
@@ -958,19 +1079,10 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
 
                 if (!has_msg) {
                     if (lw.is_local) {
-                        // Fused BlockResidualMix + RMSNorm -> buf_norm_in_[0]!
                         dispatch_mix(srcs, nsrc, 0u, lw.attn_query, 1, true,
                                      &lw.attn_norm[0], nullptr, nullptr, buf_mix_f32_, buf_norm_in_[0]);
                     } else {
-                        // Global layer: mix produces [M, 3, 2304] F32; then 3 norms? Wait: block_residual_mix
-                        // with apply_norm=1 writes [M, 3, 2304] BF16 interleaved by token!
-                        // For M=1..8, separating into buf_norm_in_[0..2] is easiest if we mix -> buf_mix_f32_,
-                        // OR even better: for global layers (only 8 of 48 visits!), mix -> buf_mix_f32_ (or if M==1 they are contiguous!).
-                        // Let's check: when M > 1, [M, 3, 2304] has stride 3*2304 between tokens for q/k/v.
-                        // Using mix -> buf_mix_f32_ then 3 tiny RMSNorms? Wait: let's just write to buf_mix_f32_ and run
-                        // RMSNorm? Actually our rms_norm_f32_to_bf16 assumes stride 2304!
-                        // So let's call dispatch_mix 3 times with query offset (0, 2304*4, 4608*4) and nq=1, apply_norm=1!
-                        // That writes DIRECTLY into contiguous [M, 2304] buf_norm_in_[0], [1], [2] with FUSED RMSNorm!!
+                        // 3-way concurrent global Q/K/V mix+norm!
                         for (int q_i = 0; q_i < 3; ++q_i) {
                             TensorRef qsub = lw.attn_query;
                             qsub.offset += size_t(q_i) * D * sizeof(float);
@@ -978,29 +1090,27 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                                          &lw.attn_norm[q_i], nullptr, nullptr, buf_mix_f32_, buf_norm_in_[q_i]);
                         }
                     }
+                    barrier();
                 } else {
-                    // pass > 0: mix to F32, then apply loop controllers + fused RMSNorm -> buf_norm_in_[0..2]
+                    // 2-way concurrent msg_mix + attn_mix!
+                    id<MTLBuffer> psrcs[5] = {buf_prev_blocks_[0], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1]};
+                    dispatch_mix(psrcs, 2, 0u, lw.msg_queries, 4, false, nullptr, nullptr, nullptr,
+                                 buf_msg_f32_, buf_norm_in_[0]);
                     dispatch_mix(srcs, nsrc, 0u, lw.attn_query, nq, false,
                                  nullptr, nullptr, nullptr, buf_mix_f32_, buf_norm_in_[0]);
-                    uint32_t istride = nq * D;
-                    for (int c_i = 0; c_i < 3; ++c_i) {
-                        uint32_t ioff = lw.is_local ? 0u : (static_cast<uint32_t>(c_i) * D);
-                        encode_controller(enc, lw.ctrl[c_i],
-                                          buf_mix_f32_, istride, ioff,
-                                          buf_msg_f32_, static_cast<uint32_t>(c_i) * D,
-                                          lw.attn_norm[c_i], buf_norm_in_[c_i], M);
-                    }
+                    barrier();
+                    // 3-way concurrent Q/K/V loop controllers (4 waves instead of 12)!
+                    encode_controllers_3way(enc, lw, buf_mix_f32_, nq * D, lw.is_local, buf_msg_f32_, M, conc);
+                    barrier();
                 }
             }
 
-            // ----- Attention Projections + ShortConv -----
+            // ----- Attention Projections (3-way concurrent when separate Q/K/V!) -----
+            open_phase(vtag + "_QKV", "qkv");
             uint32_t q_stride, r_offset, gate_offset, sink_offset;
             if (lw.is_local && !has_msg) {
-                // Single fused projection [8600, 2304] for Q(3072)+R(384)+Gate(3072)+Sink(24)+K(1024)+V(1024)!
                 encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
                               buf_q_proj_, 0, false, M, 8600, D);
-                encode_short_conv(enc, buf_q_proj_, 0, 8600, 6552, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024);
-                encode_short_conv(enc, buf_q_proj_, 0, 8600, 7576, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024);
                 q_stride = 8600; r_offset = 3072; gate_offset = 3456; sink_offset = 6528;
             } else if (lw.is_local && has_msg) {
                 encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false,
@@ -1009,23 +1119,17 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 TensorRef wv_ref = lw.fused_q_proj; wv_ref.offset += size_t(7576) * D * 2;
                 encode_linear(enc, buf_norm_in_[1], 0, false, wk_ref, nil, 0, false, buf_k_proj_, 0, false, M, 1024, D);
                 encode_linear(enc, buf_norm_in_[2], 0, false, wv_ref, nil, 0, false, buf_v_proj_, 0, false, M, 1024, D);
-                encode_short_conv(enc, buf_k_proj_, 0, 1024, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024);
-                encode_short_conv(enc, buf_v_proj_, 0, 1024, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024);
                 q_stride = 6552; r_offset = 3072; gate_offset = 3456; sink_offset = 6528;
             } else {
-                // Global layer (pass 0, 1, or 2): Q+R+Gate+Sink (6552), K+k_dyn (1056), V+v_dyn (1056)
                 encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false, buf_q_proj_, 0, false, M, 6552, D);
                 encode_linear(enc, buf_norm_in_[1], 0, false, lw.fused_k_proj, nil, 0, false, buf_k_proj_, 0, false, M, 1056, D);
                 encode_linear(enc, buf_norm_in_[2], 0, false, lw.fused_v_proj, nil, 0, false, buf_v_proj_, 0, false, M, 1056, D);
-                encode_short_conv(enc, buf_k_proj_, 0, 1056, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024, true, 1056, 1024);
-                encode_short_conv(enc, buf_v_proj_, 0, 1056, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024, true, 1056, 1024);
                 q_stride = 6552; r_offset = 3072; gate_offset = 3456; sink_offset = 6528;
             }
+            barrier();
 
-            // (Wait: fix pass-0 local branch above to also use the new [Q,R,Gate,Sink,K,V] packing!)
-            // We'll make sure model_weights.mm packs local in order [wq, wr, gate, sink, wk, wv]!
-
-            // ----- Attention Prep (ClipL2 + V RMSNorm + KV Cache Write + RelTable) -----
+            // ----- ShortConv(K, V) + AttnPrep(QR, KV) + RelTable collapsed into 2 concurrent waves! -----
+            open_phase(vtag + "_SConvPrep", "sconv_prep");
             uint32_t kv_cap = visit.local ? static_cast<uint32_t>(seq.local_kv_cap) : static_cast<uint32_t>(seq.max_global_seq);
             AttnPrepParams app{
                 M, start_pos, kv_cap, visit.local ? 1u : 0u,
@@ -1034,6 +1138,18 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 visit.local ? 0.0f : weights.cfg.log_floor,
                 visit.local ? 0.0f : weights.cfg.log_alpha
             };
+            const bool prefill_sconv = (M > 8u && !save_conv_windows);
+            // Wave A (3-way concurrent!): k_sconv + v_sconv + attn_prep_qr!
+            if (lw.is_local && !has_msg) {
+                encode_short_conv(enc, buf_q_proj_, 0, 8600, 6552, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024, false, 0, 0, prefill_sconv);
+                encode_short_conv(enc, buf_q_proj_, 0, 8600, 7576, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024, false, 0, 0, prefill_sconv);
+            } else if (lw.is_local && has_msg) {
+                encode_short_conv(enc, buf_k_proj_, 0, 1024, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024, false, 0, 0, prefill_sconv);
+                encode_short_conv(enc, buf_v_proj_, 0, 1024, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024, false, 0, 0, prefill_sconv);
+            } else {
+                encode_short_conv(enc, buf_k_proj_, 0, 1056, 0, lw.k_sconv_w, seq.conv_k[vi], seq.win_k[vi], save_conv_windows, buf_k_conv_, 0, M, 1024, true, 1056, 1024, prefill_sconv);
+                encode_short_conv(enc, buf_v_proj_, 0, 1056, 0, lw.v_sconv_w, seq.conv_v[vi], seq.win_v[vi], save_conv_windows, buf_v_conv_, 0, M, 1024, true, 1056, 1024, prefill_sconv);
+            }
             [enc setComputePipelineState:pso_attn_prep_qr_];
             [enc setBuffer:buf_q_proj_ offset:0 atIndex:0];
             [enc setBuffer:lw.q_scale.buf offset:lw.q_scale.offset atIndex:1];
@@ -1042,7 +1158,29 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
             [enc setBuffer:buf_r_bf16_ offset:0 atIndex:4];
             [enc setBytes:&app length:sizeof(app) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(24, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            barrier();
 
+            // Wave B (2-4 way concurrent!): attn_prep_kv + attn_rel_table (+ prefill conv state commits)!
+            if (prefill_sconv) {
+                auto commit_kv = [&](id<MTLBuffer> xb, uint32_t xs, uint32_t xo, id<MTLBuffer> st) {
+                    ShortConvParams cp{M, 1024u, xs, xo, 0u, 0u, 0u, 0u};
+                    [enc setComputePipelineState:pso_short_conv_commit_];
+                    [enc setBuffer:xb offset:0 atIndex:0];
+                    [enc setBuffer:st offset:0 atIndex:1];
+                    [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+                    [enc dispatchThreads:MTLSizeMake(1024u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                };
+                if (lw.is_local && !has_msg) {
+                    commit_kv(buf_q_proj_, 8600u, 6552u, seq.conv_k[vi]);
+                    commit_kv(buf_q_proj_, 8600u, 7576u, seq.conv_v[vi]);
+                } else if (lw.is_local && has_msg) {
+                    commit_kv(buf_k_proj_, 1024u, 0u, seq.conv_k[vi]);
+                    commit_kv(buf_v_proj_, 1024u, 0u, seq.conv_v[vi]);
+                } else {
+                    commit_kv(buf_k_proj_, 1056u, 0u, seq.conv_k[vi]);
+                    commit_kv(buf_v_proj_, 1056u, 0u, seq.conv_v[vi]);
+                }
+            }
             [enc setComputePipelineState:pso_attn_prep_kv_];
             [enc setBuffer:buf_k_conv_ offset:0 atIndex:0];
             [enc setBuffer:buf_v_conv_ offset:0 atIndex:1];
@@ -1067,10 +1205,10 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBuffer:buf_rel_table_ offset:0 atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(32, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            barrier();
 
             // ----- Relative-Position Attention + Fused Output Gate -----
-            // Prefill (M > 8): AMX FlashAttention-2 (BM=16, BN=32, 16x less KV bandwidth, zero partial_out!)
-            // Decode/Verify (M <= 8): Fixed parts=16 Split-KV preserves 256/256 bit-exact FP reduction tree!
+            open_phase(vtag + (visit.local ? "_AttnLoc" : "_AttnGlb"), "attn");
             uint32_t parts = 16u;
             RelAttnParams rap{
                 M, start_pos, kv_cap, visit.local ? 1u : 0u,
@@ -1099,6 +1237,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:6];
                 [enc setBytes:&rap length:sizeof(rap) atIndex:7];
                 [enc dispatchThreadgroups:MTLSizeMake(parts, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                barrier();
 
                 [enc setComputePipelineState:pso_rel_attn_merge_gate_];
                 [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:0];
@@ -1108,20 +1247,25 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBytes:&rap length:sizeof(rap) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(1, M * 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            barrier();
 
-            // ----- Output Projection + Fused Attention ShortConv + Residual Update -----
+            // ----- Output Projection (+ concurrent boundary residual copy!) -----
+            open_phase(vtag + "_WO", "wo");
             encode_linear(enc, buf_attn_out_, 0, false, lw.wo, nil, 0, false, buf_wo_out_, 0, false, M, D, 3072);
-
-            bool partial_is_f32 = false;
             if (boundary) {
+                // Disjoint buffers from WO -> runs 100% concurrently with WO!
                 blit_copy(buf_partial_bf16_, buf_res_blocks_[num_blocks], act_bytes);
                 num_blocks++;
-                // Write ShortConv output DIRECTLY into buf_partial_bf16_ (zero extra copy!)
+            }
+            barrier();
+
+            open_phase(vtag + "_AttnSConv_FFNMix", "sconv_mix");
+            bool partial_is_f32 = false;
+            if (boundary) {
                 encode_short_conv(enc, buf_wo_out_, 0, D, 0, lw.attn_sconv_w, seq.conv_attn[vi],
                                   seq.win_attn[vi], save_conv_windows, buf_partial_bf16_, 0, M, D);
                 partial_is_f32 = false;
             } else {
-                // Fused ShortConv + Residual Add into buf_partial_f32_ (40 fewer dispatches!)
                 ShortConvParams scp{M, D, D, 0u, 0u, 0u, 0u, save_conv_windows ? 1u : 0u};
                 if (M > 8u && !save_conv_windows) {
                     [enc setComputePipelineState:pso_short_conv_add_f32_prefill_];
@@ -1132,6 +1276,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                     [enc setBuffer:buf_partial_f32_ offset:0 atIndex:4];
                     [enc setBytes:&scp length:sizeof(scp) atIndex:5];
                     [enc dispatchThreads:MTLSizeMake(D, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    barrier();
 
                     [enc setComputePipelineState:pso_short_conv_commit_];
                     [enc setBuffer:buf_wo_out_ offset:0 atIndex:0];
@@ -1151,6 +1296,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 }
                 partial_is_f32 = true;
             }
+            barrier();
 
             // ----- FFN Input Preparation -----
             {
@@ -1166,16 +1312,20 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 } else {
                     dispatch_mix(srcs, nsrc, f32_mask, lw.mlp_query, 1, false,
                                  nullptr, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
+                    barrier();
                     encode_controller(enc, lw.ctrl[3],
                                       buf_mix_f32_, D, 0,
                                       buf_msg_f32_, 3u * D,
-                                      lw.mlp_norm, buf_ffn_in_, M);
+                                      lw.mlp_norm, buf_ffn_in_, M, 0, conc);
                 }
             }
+            barrier();
 
             // ----- Coalesced Multi-Token MoE + Fused Reduce + MLP ShortConv + Residual Add! -----
+            open_phase(vtag + (lw.w13.is_nvfp4 ? "_MoE_NV4" : "_MoE_FP8"), "moe");
             if (M > 8u && !save_conv_windows) {
-                encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, M, true);
+                encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, M, true, conc);
+                barrier();
                 ShortConvParams scp{M, D, D, 0u, partial_is_f32 ? 1u : 0u, 0u, 0u, 0u};
                 [enc setComputePipelineState:pso_short_conv_add_bf16_prefill_];
                 [enc setBuffer:buf_ffn_out_ offset:0 atIndex:0];
@@ -1185,6 +1335,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:4];
                 [enc setBytes:&scp length:sizeof(scp) atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(D, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                barrier();
 
                 [enc setComputePipelineState:pso_short_conv_commit_];
                 [enc setBuffer:buf_ffn_out_ offset:0 atIndex:0];
@@ -1192,7 +1343,8 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBytes:&scp length:sizeof(scp) atIndex:2];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, M, false);
+                encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, M, false, conc);
+                barrier();
                 MoEReduceConvParams rcp{M, partial_is_f32 ? 1u : 0u, save_conv_windows ? 1u : 0u};
                 [enc setComputePipelineState:pso_moe_reduce_conv_add_];
                 [enc setBuffer:buf_moe_down_ offset:0 atIndex:0];
@@ -1204,26 +1356,29 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
                 [enc setBytes:&rcp length:sizeof(rcp) atIndex:6];
                 [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            barrier();
         }
 
-        // ----- Final Output Mix + Norm -> buf_ffn_in_ [M, 2304] BF16 -----
+        // ----- Final Output Mix + Norm + Unembed + Argmax -----
+        open_phase("FinalUnembed", "unembed");
         if (capture_taps || logits_mode != LogitsMode::None) {
             id<MTLBuffer> srcs[5];
             for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
             srcs[num_blocks] = buf_partial_bf16_;
             dispatch_mix(srcs, static_cast<uint32_t>(num_blocks + 1), 0u, weights.output_query, 1, true,
                          &weights.output_norm, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
+            barrier();
         }
 
         if (capture_taps) {
             blit_copy(buf_ffn_in_, buf_taps_[3], act_bytes);
         }
 
-        // ----- Unembed [200058, 2304] BF16 + Fused Softcap(30.0) + GPU Argmax -----
         uint32_t V = weights.cfg.unpadded_vocab;
         if (logits_mode == LogitsMode::LastOnly) {
             encode_linear(enc, buf_ffn_in_, size_t(M - 1) * D * 2, false, weights.unembed, nil, 0, false,
                           buf_logits_, 0, true, 1, V, D, weights.cfg.logit_cap);
+            barrier();
             [enc setComputePipelineState:pso_argmax_];
             [enc setBuffer:buf_logits_ offset:0 atIndex:0];
             [enc setBuffer:buf_argmax_ offset:0 atIndex:1];
@@ -1232,6 +1387,7 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
         } else if (logits_mode == LogitsMode::All) {
             encode_linear(enc, buf_ffn_in_, 0, false, weights.unembed, nil, 0, false,
                           buf_logits_, 0, true, M, V, D, weights.cfg.logit_cap);
+            barrier();
             [enc setComputePipelineState:pso_argmax_];
             [enc setBuffer:buf_logits_ offset:0 atIndex:0];
             [enc setBuffer:buf_argmax_ offset:0 atIndex:1];
@@ -1240,8 +1396,73 @@ std::vector<int32_t> InklingEngine::forward_target_single(SequenceState& seq,
         }
 
         [enc endEncoding];
+        cpu_commit_ms = now_ms();
         [cb commit];
         [cb waitUntilCompleted];
+        cpu_done_ms = now_ms();
+        cb_kern_start_s = cb.kernelStartTime;
+        cb_gpu_start_s  = cb.GPUStartTime;
+        cb_gpu_end_s    = cb.GPUEndTime;
+
+        if (tracing && !trace_phases.empty()) {
+            NSData* data = [trace_csb_ resolveCounterRange:NSMakeRange(0, trace_phases.size() * 2)];
+            const uint64_t* ts = reinterpret_cast<const uint64_t*>(data.bytes);
+            // Calibrate ticks -> ns (Apple M4 Pro is 1.0 ns/tick)
+            MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
+            [device sampleTimestamps:&c0 gpuTimestamp:&g0];
+            double ns_per_tick = 1.0;
+            if (g0 == 0) ns_per_tick = 1.0;
+            (void)c1; (void)g1;
+            uint64_t t_base = ts[0];
+            std::ofstream tf(trace_path);
+            tf << "{\"traceEvents\":[\n";
+            tf << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"Apple M4 Pro GPU\"}},\n";
+            tf << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,\"args\":{\"name\":\"Compute Phases (HW Timestamps)\"}},\n";
+            tf << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":2,\"args\":{\"name\":\"Command Buffer Total\"}},\n";
+            tf << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":2,\"args\":{\"name\":\"CPU Host\"}},\n";
+            tf << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":1,\"args\":{\"name\":\"Submit + Wait\"}},\n";
+
+            double sum_active_us = 0.0, sum_gap_us = 0.0;
+            double cat_us[8] = {};
+            const char* cat_names[8] = {"embed", "mix_ctrl", "qkv", "sconv_prep", "attn", "wo", "sconv_mix", "moe"};
+            double unembed_us = 0.0;
+            for (size_t i = 0; i < trace_phases.size(); ++i) {
+                uint64_t s = ts[i * 2];
+                uint64_t e = ts[i * 2 + 1];
+                double ts_us = double(s - t_base) * ns_per_tick / 1000.0;
+                double dur_us = (e >= s) ? double(e - s) * ns_per_tick / 1000.0 : 0.0;
+                sum_active_us += dur_us;
+                if (i > 0 && s > ts[(i - 1) * 2 + 1]) {
+                    sum_gap_us += double(s - ts[(i - 1) * 2 + 1]) * ns_per_tick / 1000.0;
+                }
+                if (trace_phases[i].cat == "unembed") unembed_us += dur_us;
+                else {
+                    for (int c = 0; c < 8; ++c) {
+                        if (trace_phases[i].cat == cat_names[c]) { cat_us[c] += dur_us; break; }
+                    }
+                }
+                tf << "{\"name\":\"" << trace_phases[i].name << "\",\"cat\":\"" << trace_phases[i].cat
+                   << "\",\"ph\":\"X\",\"ts\":" << ts_us << ",\"dur\":" << dur_us
+                   << ",\"pid\":1,\"tid\":1},\n";
+            }
+            double total_gpu_us = (cb_gpu_end_s - cb_gpu_start_s) * 1e6;
+            double enc_us = (cpu_commit_ms - cpu_enc_start_ms) * 1000.0;
+            double wait_us = (cpu_done_ms - cpu_commit_ms) * 1000.0;
+            double submit_us = (cb_gpu_start_s - cb_kern_start_s) * 1e6;
+            tf << "{\"name\":\"CB_GPU_Total\",\"cat\":\"cb\",\"ph\":\"X\",\"ts\":0,\"dur\":" << total_gpu_us << ",\"pid\":1,\"tid\":2},\n";
+            tf << "{\"name\":\"CPU_Encode\",\"cat\":\"cpu\",\"ph\":\"X\",\"ts\":0,\"dur\":" << enc_us << ",\"pid\":2,\"tid\":1},\n";
+            tf << "{\"name\":\"CPU_WaitUntilCompleted\",\"cat\":\"cpu\",\"ph\":\"X\",\"ts\":" << enc_us << ",\"dur\":" << wait_us << ",\"pid\":2,\"tid\":1}\n";
+            tf << "]}\n";
+            tf.close();
+            fprintf(stderr,
+                    "[trace] Wrote %zu HW GPU phases -> %s (mode=%s, M=%u)\n"
+                    "        GPU CB=%.2fms | SumPhases=%.2fms | InterPhaseGaps=%.2fms | CPU_Encode=%.2fms | SubmitGap=%.2fms\n"
+                    "        Breakdown: MixCtrl=%.2f | QKV=%.2f | SConvPrep=%.2f | Attn=%.2f | WO=%.2f | AttnSC+FFNMix=%.2f | MoE=%.2f | Unembed=%.2f ms\n",
+                    trace_phases.size(), trace_path.c_str(), conc ? "CONCURRENT" : "SERIAL", M,
+                    total_gpu_us / 1000.0, sum_active_us / 1000.0, sum_gap_us / 1000.0, enc_us / 1000.0, submit_us / 1000.0,
+                    cat_us[1]/1000.0, cat_us[2]/1000.0, cat_us[3]/1000.0, cat_us[4]/1000.0,
+                    cat_us[5]/1000.0, cat_us[6]/1000.0, cat_us[7]/1000.0, unembed_us/1000.0);
+        }
     }
 
     seq.pos += static_cast<int>(M);
@@ -1300,9 +1521,12 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
     for (auto* s : seqs) ensure_global_capacity(*s, s->pos + 1);
     std::memcpy(buf_tok_ids_.contents, tokens.data(), B * sizeof(int32_t));
 
+    const bool conc = use_concurrent_dispatch;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:
+            (conc ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
+        auto barrier = [&]() { if (conc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
         [enc setComputePipelineState:pso_embed_rms_];
         [enc setBuffer:buf_tok_ids_ offset:0 atIndex:0];
@@ -1311,6 +1535,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
         [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:3];
         [enc setBytes:&eps length:4 atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+        barrier();
 
         auto blit_copy = [&](id<MTLBuffer> src, id<MTLBuffer> dst, size_t nbytes) {
             uint32_t n4 = static_cast<uint32_t>(nbytes / 8); // bfloat4 = 8 bytes
@@ -1355,17 +1580,14 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 } else {
                     blit_copy(buf_res_blocks_[prelude_num_blocks + 1], buf_prev_blocks_[0], act_bytes);
                     blit_copy(buf_partial_bf16_, buf_prev_blocks_[1], act_bytes);
+                    barrier();
                     num_blocks = prelude_num_blocks;
                     blit_copy(buf_prelude_partial_, buf_partial_bf16_, act_bytes);
+                    barrier();
                 }
             }
 
             bool has_msg = (visit.pass > 0);
-            if (has_msg) {
-                id<MTLBuffer> psrcs[5] = {buf_prev_blocks_[0], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1]};
-                dispatch_mix(psrcs, 2, 0u, lw.msg_queries, 4, false, nullptr, nullptr, nullptr, buf_msg_f32_, buf_norm_in_[0]);
-            }
-
             if (num_blocks == 0) {
                 [enc setComputePipelineState:pso_rms_bf16_];
                 [enc setBuffer:buf_partial_bf16_ offset:0 atIndex:0];
@@ -1373,6 +1595,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 [enc setBuffer:buf_norm_in_[0] offset:0 atIndex:2];
                 [enc setBytes:&eps length:4 atIndex:3];
                 [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+                barrier();
             } else {
                 id<MTLBuffer> srcs[5];
                 for (int b = 0; b < num_blocks; ++b) srcs[b] = buf_res_blocks_[b];
@@ -1388,17 +1611,18 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                             dispatch_mix(srcs, nsrc, 0u, qsub, 1, true, &lw.attn_norm[q_i], nullptr, nullptr, buf_mix_f32_, buf_norm_in_[q_i]);
                         }
                     }
+                    barrier();
                 } else {
+                    id<MTLBuffer> psrcs[5] = {buf_prev_blocks_[0], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1], buf_prev_blocks_[1]};
+                    dispatch_mix(psrcs, 2, 0u, lw.msg_queries, 4, false, nullptr, nullptr, nullptr, buf_msg_f32_, buf_norm_in_[0]);
                     dispatch_mix(srcs, nsrc, 0u, lw.attn_query, nq, false, nullptr, nullptr, nullptr, buf_mix_f32_, buf_norm_in_[0]);
-                    uint32_t istride = nq * D;
-                    for (int c_i = 0; c_i < 3; ++c_i) {
-                        uint32_t ioff = lw.is_local ? 0u : (static_cast<uint32_t>(c_i) * D);
-                        encode_controller(enc, lw.ctrl[c_i], buf_mix_f32_, istride, ioff, buf_msg_f32_, uint32_t(c_i) * D, lw.attn_norm[c_i], buf_norm_in_[c_i], B);
-                    }
+                    barrier();
+                    encode_controllers_3way(enc, lw, buf_mix_f32_, nq * D, lw.is_local, buf_msg_f32_, B, conc);
+                    barrier();
                 }
             }
 
-            // Shared-weight batched projections across all B sequences!
+            // Shared-weight batched projections (3-way concurrent when separate Q/K/V!)
             uint32_t q_stride;
             if (lw.is_local && !has_msg) {
                 encode_linear(enc, buf_norm_in_[0], 0, false, lw.fused_q_proj, nil, 0, false, buf_q_proj_, 0, false, B, 8600, D);
@@ -1416,8 +1640,10 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 encode_linear(enc, buf_norm_in_[2], 0, false, lw.fused_v_proj, nil, 0, false, buf_v_proj_, 0, false, B, 1056, D);
                 q_stride = 6552;
             }
+            barrier();
 
-            // Per-sequence conv + attention (each seq has its own KV & conv state)
+            // Per-sequence conv + attention in 4 B-WAY CONCURRENT WAVES (instead of 9*B serial dispatches!)
+            // Wave 1 (3B concurrent): k_sconv + v_sconv + attn_prep_qr across ALL B sequences!
             for (uint32_t bi = 0; bi < B; ++bi) {
                 SequenceState& seq = *seqs[bi];
                 uint32_t spos = static_cast<uint32_t>(seq.pos);
@@ -1445,7 +1671,18 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 [enc setBuffer:buf_r_bf16_ offset:size_t(bi) * 24 * 16 * 2 atIndex:4];
                 [enc setBytes:&app length:sizeof(app) atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(24, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            barrier();
 
+            // Wave 2 (2B concurrent): attn_prep_kv + attn_rel_table across ALL B sequences!
+            for (uint32_t bi = 0; bi < B; ++bi) {
+                SequenceState& seq = *seqs[bi];
+                uint32_t spos = static_cast<uint32_t>(seq.pos);
+                uint32_t kv_cap = visit.local ? uint32_t(seq.local_kv_cap) : uint32_t(seq.max_global_seq);
+                AttnPrepParams app{1, spos, kv_cap, visit.local ? 1u : 0u, q_stride, 3072u,
+                                   weights.cfg.qk_clip, weights.cfg.rel_clip, eps,
+                                   visit.local ? 0.0f : weights.cfg.log_floor,
+                                   visit.local ? 0.0f : weights.cfg.log_alpha};
                 [enc setComputePipelineState:pso_attn_prep_kv_];
                 [enc setBuffer:buf_k_conv_ offset:size_t(bi) * 1024 * 2 atIndex:0];
                 [enc setBuffer:buf_v_conv_ offset:size_t(bi) * 1024 * 2 atIndex:1];
@@ -1459,37 +1696,61 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 [enc setBuffer:lw.rel_proj.buf offset:lw.rel_proj.offset atIndex:1];
                 [enc setBuffer:buf_rel_table_ offset:size_t(bi) * 24 * 1024 * 2 atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(32, 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            barrier();
 
-                uint32_t parts = 16u;
+            // Wave 3 (B concurrent): rel_attn_split across ALL B sequences into disjoint partial slices!
+            const uint32_t parts = 16u;
+            const size_t part_out_stride = size_t(24) * parts * 128 * sizeof(float);
+            const size_t part_st_stride  = size_t(24) * parts * 8;
+            [enc setComputePipelineState:pso_rel_attn_split_];
+            for (uint32_t bi = 0; bi < B; ++bi) {
+                SequenceState& seq = *seqs[bi];
+                uint32_t spos = static_cast<uint32_t>(seq.pos);
+                uint32_t kv_cap = visit.local ? uint32_t(seq.local_kv_cap) : uint32_t(seq.max_global_seq);
                 RelAttnParams rap{1, spos, kv_cap, visit.local ? 1u : 0u,
                                   visit.local ? uint32_t(weights.cfg.window) : 0u,
                                   parts, q_stride, 3456u, 6528u, 1.0f / std::sqrt(128.0f)};
-                [enc setComputePipelineState:pso_rel_attn_split_];
                 [enc setBuffer:buf_q_f32_ offset:size_t(bi) * 24 * 128 * 4 atIndex:0];
                 [enc setBuffer:seq.k_cache[vi] offset:0 atIndex:1];
                 [enc setBuffer:seq.v_cache[vi] offset:0 atIndex:2];
                 [enc setBuffer:buf_rel_table_ offset:size_t(bi) * 24 * 1024 * 2 atIndex:3];
                 [enc setBuffer:buf_q_proj_ offset:size_t(bi) * q_stride * 2 atIndex:4];
-                [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:5];
-                [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:6];
+                [enc setBuffer:buf_attn_part_out_ offset:size_t(bi) * part_out_stride atIndex:5];
+                [enc setBuffer:buf_attn_part_st_ offset:size_t(bi) * part_st_stride atIndex:6];
                 [enc setBytes:&rap length:sizeof(rap) atIndex:7];
                 [enc dispatchThreadgroups:MTLSizeMake(parts, 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            barrier();
 
-                [enc setComputePipelineState:pso_rel_attn_merge_gate_];
-                [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:0];
-                [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:1];
+            // Wave 4 (B concurrent): rel_attn_merge_gate across ALL B sequences!
+            [enc setComputePipelineState:pso_rel_attn_merge_gate_];
+            for (uint32_t bi = 0; bi < B; ++bi) {
+                SequenceState& seq = *seqs[bi];
+                uint32_t spos = static_cast<uint32_t>(seq.pos);
+                uint32_t kv_cap = visit.local ? uint32_t(seq.local_kv_cap) : uint32_t(seq.max_global_seq);
+                RelAttnParams rap{1, spos, kv_cap, visit.local ? 1u : 0u,
+                                  visit.local ? uint32_t(weights.cfg.window) : 0u,
+                                  parts, q_stride, 3456u, 6528u, 1.0f / std::sqrt(128.0f)};
+                [enc setBuffer:buf_attn_part_out_ offset:size_t(bi) * part_out_stride atIndex:0];
+                [enc setBuffer:buf_attn_part_st_ offset:size_t(bi) * part_st_stride atIndex:1];
                 [enc setBuffer:buf_q_proj_ offset:size_t(bi) * q_stride * 2 atIndex:2];
                 [enc setBuffer:buf_attn_out_ offset:size_t(bi) * 3072 * 2 atIndex:3];
                 [enc setBytes:&rap length:sizeof(rap) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(1, 24, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            barrier();
 
-            // Batched WO + Fused per-seq attn_sconv + residual update
+            // Batched WO (+ concurrent boundary copy!) -> B-way concurrent attn_sconv
             encode_linear(enc, buf_attn_out_, 0, false, lw.wo, nil, 0, false, buf_wo_out_, 0, false, B, D, 3072);
-            bool partial_is_f32 = false;
             if (boundary) {
                 blit_copy(buf_partial_bf16_, buf_res_blocks_[num_blocks], act_bytes);
                 num_blocks++;
+            }
+            barrier();
+
+            bool partial_is_f32 = false;
+            if (boundary) {
                 for (uint32_t bi = 0; bi < B; ++bi) {
                     encode_short_conv(enc, buf_wo_out_, size_t(bi) * D * 2, D, 0, lw.attn_sconv_w,
                                       seqs[bi]->conv_attn[vi], nil, false,
@@ -1510,6 +1771,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                 }
                 partial_is_f32 = true;
             }
+            barrier();
 
             {
                 id<MTLBuffer> srcs[5];
@@ -1521,12 +1783,15 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                     dispatch_mix(srcs, nsrc, f32_mask, lw.mlp_query, 1, true, &lw.mlp_norm, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
                 } else {
                     dispatch_mix(srcs, nsrc, f32_mask, lw.mlp_query, 1, false, nullptr, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
-                    encode_controller(enc, lw.ctrl[3], buf_mix_f32_, D, 0, buf_msg_f32_, 3u * D, lw.mlp_norm, buf_ffn_in_, B);
+                    barrier();
+                    encode_controller(enc, lw.ctrl[3], buf_mix_f32_, D, 0, buf_msg_f32_, 3u * D, lw.mlp_norm, buf_ffn_in_, B, 0, conc);
                 }
             }
+            barrier();
 
-            // Coalesced MoE across ALL B sequences + Fused Reduce + MLP ShortConv + Residual Add!
-            encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, B, false);
+            // Coalesced MoE across ALL B sequences + B-way concurrent Reduce + MLP ShortConv + Residual Add!
+            encode_moe(enc, lw, buf_ffn_in_, buf_ffn_out_, B, false, conc);
+            barrier();
             {
                 MoEReduceConvParams rcp{1u, partial_is_f32 ? 1u : 0u, 0u};
                 [enc setComputePipelineState:pso_moe_reduce_conv_add_];
@@ -1542,6 +1807,7 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
                     [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 }
             }
+            barrier();
         }
 
         {
@@ -1550,9 +1816,11 @@ std::vector<int32_t> InklingEngine::forward_target_batch(std::vector<SequenceSta
             srcs[num_blocks] = buf_partial_bf16_;
             dispatch_mix(srcs, uint32_t(num_blocks + 1), 0u, weights.output_query, 1, true, &weights.output_norm, nullptr, nullptr, buf_mix_f32_, buf_ffn_in_);
         }
+        barrier();
 
         uint32_t V = weights.cfg.unpadded_vocab;
         encode_linear(enc, buf_ffn_in_, 0, false, weights.unembed, nil, 0, false, buf_logits_, 0, true, B, V, D, weights.cfg.logit_cap);
+        barrier();
         [enc setComputePipelineState:pso_argmax_];
         [enc setBuffer:buf_logits_ offset:0 atIndex:0];
         [enc setBuffer:buf_argmax_ offset:0 atIndex:1];
@@ -1692,11 +1960,31 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
     std::memcpy(buf_draft_tok_.contents, &anchor_token, 4);
     std::memset(seq.draft_rnn_state.contents, 0, 256 * 2);
 
+    const bool conc = use_concurrent_dispatch;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:
+            (conc ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
+        auto barrier = [&]() { if (conc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
-        // Fused context flush (in the SAME command buffer — zero extra CPU-GPU sync!)
+        // Fused context flush + Row 0 embed + Rows 1..7 mask copy (overlapping independent work!)
+        [enc setComputePipelineState:pso_embed_rms_];
+        [enc setBuffer:buf_draft_tok_ offset:0 atIndex:0];
+        [enc setBuffer:weights.embed.buf offset:weights.embed.offset atIndex:1];
+        [enc setBuffer:weights.embed_norm.buf offset:weights.embed_norm.offset atIndex:2];
+        [enc setBuffer:buf_draft_x_bf16_ offset:0 atIndex:3];
+        [enc setBytes:&eps length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+
+        uint32_t d4 = D / 4u;
+        [enc setComputePipelineState:pso_copy_bf16_];
+        for (uint32_t r = 1; r < block_len; ++r) {
+            [enc setBuffer:weights.draft.mask_embed.buf offset:weights.draft.mask_embed.offset atIndex:0];
+            [enc setBuffer:buf_draft_x_bf16_ offset:size_t(r) * D * 2 atIndex:1];
+            [enc setBytes:&d4 length:4 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(d4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
         if (flush_chunk > 0) {
             float fw3[4] = {weights.draft.fuse_weights[3][0], weights.draft.fuse_weights[3][1],
                             weights.draft.fuse_weights[3][2], weights.draft.fuse_weights[3][3]};
@@ -1720,9 +2008,11 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
                 [enc setBytes:fw length:sizeof(fw) atIndex:6];
                 [enc setBytes:&eps length:4 atIndex:7];
                 [enc dispatchThreadgroups:MTLSizeMake(flush_chunk, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+                barrier();
 
                 encode_linear(enc, buf_draft_ctx_mix_, 0, false, dl.ctx_kv_proj, nil, 0, false,
                               buf_draft_ctx_kv_, 0, false, flush_chunk, 2048, D);
+                barrier();
 
                 uint32_t kv_cap = dl.is_local ? uint32_t(seq.local_kv_cap) : uint32_t(seq.max_global_seq);
                 DraftRopeParams kp{flush_chunk, 8, 2048, 0, flush_start_pos,
@@ -1740,26 +2030,10 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
                 [enc setBuffer:seq.draft_v_cache[li] offset:0 atIndex:1];
                 [enc setBytes:&vp length:sizeof(vp) atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(8, flush_chunk, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                barrier();
             }
-        }
-
-        // Row 0 = embed_rms(anchor_token) -> buf_draft_x_bf16_[0]
-        [enc setComputePipelineState:pso_embed_rms_];
-        [enc setBuffer:buf_draft_tok_ offset:0 atIndex:0];
-        [enc setBuffer:weights.embed.buf offset:weights.embed.offset atIndex:1];
-        [enc setBuffer:weights.embed_norm.buf offset:weights.embed_norm.offset atIndex:2];
-        [enc setBuffer:buf_draft_x_bf16_ offset:0 atIndex:3];
-        [enc setBytes:&eps length:4 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
-
-        // Copy mask_embed to rows 1..7 via copy_bf16 (stay in ONE compute encoder!)
-        uint32_t d4 = D / 4u;
-        [enc setComputePipelineState:pso_copy_bf16_];
-        for (uint32_t r = 1; r < block_len; ++r) {
-            [enc setBuffer:weights.draft.mask_embed.buf offset:weights.draft.mask_embed.offset atIndex:0];
-            [enc setBuffer:buf_draft_x_bf16_ offset:size_t(r) * D * 2 atIndex:1];
-            [enc setBytes:&d4 length:4 atIndex:2];
-            [enc dispatchThreads:MTLSizeMake(d4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            barrier();
         }
 
         bool x_is_f32 = false;
@@ -1772,13 +2046,15 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBuffer:buf_draft_norm_ offset:0 atIndex:2];
             [enc setBytes:&eps length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(block_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+            barrier();
 
             // 2. QKV [5120, 2304]
             encode_linear(enc, buf_draft_norm_, 0, false, dl.qkv_proj, nil, 0, false,
                           buf_draft_qkv_, 0, false, block_len, 5120, D);
+            barrier();
 
+            // 3-way concurrent Q_rope + K_rope + V_cache!
             uint32_t kv_cap = dl.is_local ? uint32_t(seq.local_kv_cap) : uint32_t(seq.max_global_seq);
-            // Q norm + RoPE -> buf_draft_q_
             DraftRopeParams qp{block_len, 24, 5120, 0, ctx_pos, weights.draft.rope_theta, eps, 0u, kv_cap, 0u};
             [enc setComputePipelineState:pso_draft_qk_rope_];
             [enc setBuffer:buf_draft_qkv_ offset:0 atIndex:0];
@@ -1787,7 +2063,6 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBytes:&qp length:sizeof(qp) atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(24, block_len, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            // K norm + RoPE -> draft_k_cache[ctx_pos .. ctx_pos+7]
             DraftRopeParams kp{block_len, 8, 5120, 3072, ctx_pos, weights.draft.rope_theta, eps, 1u, kv_cap, dl.is_local ? 1u : 0u};
             [enc setComputePipelineState:pso_draft_qk_rope_];
             [enc setBuffer:buf_draft_qkv_ offset:0 atIndex:0];
@@ -1796,13 +2071,13 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBytes:&kp length:sizeof(kp) atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(8, block_len, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            // V -> draft_v_cache[ctx_pos .. ctx_pos+7]
             DraftRopeParams vp = kp; vp.offset = 4096;
             [enc setComputePipelineState:pso_draft_v_cache_];
             [enc setBuffer:buf_draft_qkv_ offset:0 atIndex:0];
             [enc setBuffer:seq.draft_v_cache[li] offset:0 atIndex:1];
             [enc setBytes:&vp length:sizeof(vp) atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(8, block_len, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            barrier();
 
             // 3. Bidirectional attention over [start, ctx_pos + 8)
             uint32_t end_pos = ctx_pos + block_len;
@@ -1820,6 +2095,7 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
                 [enc setBuffer:buf_attn_part_st_ offset:0 atIndex:4];
                 [enc setBytes:&ap length:sizeof(ap) atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(parts, 8, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                barrier();
 
                 [enc setComputePipelineState:pso_draft_bidir_attn_merge_];
                 [enc setBuffer:buf_attn_part_out_ offset:0 atIndex:0];
@@ -1837,9 +2113,11 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
                 [enc setBytes:&ap length:sizeof(ap) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(24, block_len, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            barrier();
 
             // 4. O proj + residual sum (draftResidualSum)
             encode_linear(enc, buf_draft_attn_, 0, false, dl.o_proj, nil, 0, false, buf_draft_o_, 0, false, block_len, D, 3072);
+            barrier();
             uint32_t n4 = (block_len * D) / 4u;
             if (!x_is_f32) {
                 [enc setComputePipelineState:pso_add_bf16_f32_];
@@ -1857,6 +2135,7 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
                 [enc setBytes:&n4 length:4 atIndex:3];
                 [enc dispatchThreads:MTLSizeMake(n4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            barrier();
 
             // 5. FFN norm + gate_up + SwiGLU + down + residual sum
             [enc setComputePipelineState:pso_rms_f32_];
@@ -1865,22 +2144,27 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBuffer:buf_draft_norm_ offset:0 atIndex:2];
             [enc setBytes:&eps length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(block_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+            barrier();
 
             encode_linear(enc, buf_draft_norm_, 0, false, dl.gate_up_proj, nil, 0, false,
                           buf_draft_gate_up_, 0, false, block_len, 18432, D);
+            barrier();
             [enc setComputePipelineState:pso_draft_swiglu_];
             [enc setBuffer:buf_draft_gate_up_ offset:0 atIndex:0];
             [enc setBuffer:buf_draft_swiglu_ offset:0 atIndex:1];
             [enc dispatchThreads:MTLSizeMake(9216, block_len, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
 
             encode_linear(enc, buf_draft_swiglu_, 0, false, dl.down_proj, nil, 0, false,
                           buf_draft_o_, 0, false, block_len, D, 9216);
+            barrier();
             [enc setComputePipelineState:pso_draft_res_add_];
             [enc setBuffer:buf_draft_x_f32_ offset:0 atIndex:0];
             [enc setBuffer:buf_draft_o_ offset:0 atIndex:1];
             [enc setBuffer:buf_draft_x_f32_ offset:0 atIndex:2];
             [enc setBytes:&n4 length:4 atIndex:3];
             [enc dispatchThreads:MTLSizeMake(n4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
         }
 
         // Final draft norm -> buf_draft_x_bf16_ [8, 2304]
@@ -1890,16 +2174,17 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
         [enc setBuffer:buf_draft_x_bf16_ offset:0 atIndex:2];
         [enc setBytes:&eps length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(block_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(288, 1, 1)];
+        barrier();
 
         // Base logits for rows 1..draft_len (7 rows) -> buf_draft_base_logits_ [draft_len, V] BF16
         uint32_t dlen = static_cast<uint32_t>(std::clamp(draft_len, 1, 7));
         encode_linear(enc, buf_draft_x_bf16_, D * 2, false, weights.unembed, nil, 0, false,
                       buf_draft_base_logits_, 0, false, dlen, V, D, 0.0f);
+        barrier();
 
-        // Markov RNN sequential selection for i = 0 .. dlen-1 (parallelized across 96 TGs!)
+        // Markov RNN sequential selection for i = 0 .. dlen-1
         float lcap = weights.cfg.logit_cap;
         for (uint32_t i = 0; i < dlen; ++i) {
-            // 1. Pack concat(state, markov_w1[tok], hidden[i+1], feature) -> [5120] BF16
             [enc setComputePipelineState:pso_draft_markov_pack_];
             [enc setBuffer:buf_draft_tok_ offset:size_t(i) * 4 atIndex:0];
             [enc setBuffer:weights.draft.markov_w1.buf offset:weights.draft.markov_w1.offset atIndex:1];
@@ -1908,20 +2193,20 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBuffer:seq.draft_rnn_state offset:0 atIndex:4];
             [enc setBuffer:buf_draft_rnn_in_ offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(5120, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
 
-            // 2. Parallel rnn_proj [768, 5120] + bias -> buf_draft_rnn_gates_ [768] BF16
             encode_linear(enc, buf_draft_rnn_in_, 0, false, weights.draft.rnn_proj_w,
                           weights.draft.rnn_proj_b.buf, weights.draft.rnn_proj_b.offset, true,
                           buf_draft_rnn_gates_, 0, false, 1, 768, 5120);
+            barrier();
 
-            // 3. Update state & write latent
             [enc setComputePipelineState:pso_draft_markov_update_];
             [enc setBuffer:buf_draft_rnn_gates_ offset:0 atIndex:0];
             [enc setBuffer:seq.draft_rnn_state offset:0 atIndex:1];
             [enc setBuffer:buf_draft_latent_ offset:0 atIndex:2];
             [enc dispatchThreads:MTLSizeMake(256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
 
-            // Folded head correction + softcap -> buf_draft_step_logits_ [V] F32
             [enc setComputePipelineState:pso_draft_folded_logits_];
             [enc setBuffer:buf_draft_base_logits_ offset:size_t(i) * V * 2 atIndex:0];
             [enc setBuffer:buf_draft_latent_ offset:0 atIndex:1];
@@ -1931,13 +2216,14 @@ std::vector<int32_t> InklingEngine::draft_propose(SequenceState& seq, int32_t an
             [enc setBytes:&V length:4 atIndex:5];
             [enc setBytes:&lcap length:4 atIndex:6];
             [enc dispatchThreadgroups:MTLSizeMake((V + 15u) / 16u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
 
-            // Argmax -> buf_draft_tok_[i+1]
             [enc setComputePipelineState:pso_argmax_];
             [enc setBuffer:buf_draft_step_logits_ offset:0 atIndex:0];
             [enc setBuffer:buf_draft_tok_ offset:size_t(i + 1) * 4 atIndex:1];
             [enc setBytes:&V length:4 atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            barrier();
         }
 
         [enc endEncoding];
@@ -2072,9 +2358,9 @@ std::vector<int32_t> InklingEngine::generate_speculative(SequenceState& seq,
     const bool adaptive = (draft_depth <= 0);
     const int fixed_depth = std::clamp(draft_depth, 1, 7);
 
-    // M4 Pro empirical round cost model (target_verify(1+d) + draft_propose(d), ms)
-    static constexpr double kPlainMs = 30.6;
-    static constexpr double kRoundMs[8] = {30.6, 42.3, 47.8, 52.6, 59.9, 65.4, 71.1, 77.2};
+    // M4 Pro empirical round cost model (target_verify(1+d) + draft_propose(d), ms, concurrent dispatch)
+    static constexpr double kPlainMs = 29.1;
+    static constexpr double kRoundMs[8] = {29.1, 40.5, 45.9, 50.6, 57.6, 62.9, 68.5, 74.4};
     // Per-position conditional acceptance EMAs P(accept_k | accept_{<k}) for k = 0..6
     // Captures DSpark's non-geometric position decay without over-drafting!
     double pos_succ[7]   = {3.6, 3.2, 2.8, 2.3, 1.9, 1.5, 1.2};

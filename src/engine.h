@@ -77,6 +77,10 @@ public:
     InklingWeights weights;
     InklingTokenizer tokenizer;
     PrefixCache prefix_cache;
+    bool use_concurrent_dispatch = true; // MTLDispatchTypeConcurrent for independent kernels + explicit barriers
+
+    // Request a hardware-timestamped Perfetto / chrome://tracing JSON dump on the next forward_target_single() call.
+    void set_next_trace_path(const std::string& json_path) { next_trace_path_ = json_path; }
 
     bool init(const std::string& manifest_path,
               const std::string& blobs_dir,
@@ -232,9 +236,11 @@ private:
     id<MTLBuffer> buf_msg_f32_ = nil;       // [MAX_M, 4, 2304] F32
     id<MTLBuffer> buf_norm_in_[3] = {};     // [MAX_M, 2304] BF16 (q_in, k_in, v_in)
     id<MTLBuffer> buf_ffn_in_ = nil;        // [MAX_M, 2304] BF16
-    id<MTLBuffer> buf_ctrl_concat_ = nil;   // [MAX_M, 4608] BF16
-    id<MTLBuffer> buf_ctrl_down_ = nil;     // [MAX_M, 64] F32
-    id<MTLBuffer> buf_ctrl_gf_ = nil;       // [MAX_M, 4608] F32
+    id<MTLBuffer> buf_ctrl_concat_[3] = {}; // 3 slots for 3-way concurrent Q/K/V controllers
+    id<MTLBuffer> buf_ctrl_down_[3] = {};
+    id<MTLBuffer> buf_ctrl_gf_[3] = {};
+    id<MTLCounterSampleBuffer> trace_csb_ = nil;
+    std::string next_trace_path_;
 
     id<MTLBuffer> buf_q_proj_ = nil;        // [MAX_M, 8592] BF16
     id<MTLBuffer> buf_k_proj_ = nil;        // [MAX_M, 1056] BF16
@@ -302,7 +308,8 @@ private:
                            id<MTLBuffer> win, bool save_win,
                            id<MTLBuffer> out, size_t out_off,
                            uint32_t M, uint32_t C,
-                           bool is_dynamic = false, uint32_t dyn_stride = 0, uint32_t dyn_el_off = 0);
+                           bool is_dynamic = false, uint32_t dyn_stride = 0, uint32_t dyn_el_off = 0,
+                           bool skip_commit = false);
 
     void encode_controller(id<MTLComputeCommandEncoder> enc,
                            const ControllerWeights& ctrl,
@@ -310,14 +317,24 @@ private:
                            id<MTLBuffer> msg, uint32_t msg_off,
                            const TensorRef& norm_w,
                            id<MTLBuffer> out_bf16,
-                           uint32_t M);
+                           uint32_t M,
+                           int slot = 0,
+                           bool concurrent = false);
+
+    void encode_controllers_3way(id<MTLComputeCommandEncoder> enc,
+                                 const LayerWeights& lw,
+                                 id<MTLBuffer> inp, uint32_t inp_stride, bool is_local,
+                                 id<MTLBuffer> msg,
+                                 uint32_t M,
+                                 bool concurrent);
 
     void encode_moe(id<MTLComputeCommandEncoder> enc,
                     const LayerWeights& lw,
                     id<MTLBuffer> ffn_in,
                     id<MTLBuffer> ffn_out,
                     uint32_t M,
-                    bool do_reduce = true);
+                    bool do_reduce = true,
+                    bool concurrent = false);
 
     int32_t sample_logits_cpu(const float* logits,
                               const SamplingParams& sampling,

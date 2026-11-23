@@ -33,7 +33,8 @@ static void print_usage(const char* prog) {
            "  --blobs <dir>         Ollama blobs directory\n"
            "  --metal <path>        Path to kernels.metal\n"
            "  --stream              Stream tokens as generated\n"
-           "  --dump-ids            Print prompt and generated token IDs\n",
+           "  --dump-ids            Print prompt and generated token IDs\n"
+           "  --trace <path.json>   Dump HW GPU Perfetto/chrome://tracing JSON for first decode/prefill step\n",
            prog);
 }
 
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
     SamplingParams sampling;
     bool stream = false;
     bool dump_ids = false;
+    std::string trace_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -84,6 +86,7 @@ int main(int argc, char** argv) {
         else if (a == "--metal" && i + 1 < argc) { metal_path = argv[++i]; }
         else if (a == "--stream") { stream = true; }
         else if (a == "--dump-ids") { dump_ids = true; }
+        else if (a == "--trace" && i + 1 < argc) { trace_path = argv[++i]; }
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
     }
 
@@ -136,6 +139,7 @@ int main(int argc, char** argv) {
                 stats.gen_tokens - batch_size, stats.decode_ms, dec_tps, dec_tps / batch_size);
     } else {
         auto seq = engine.create_sequence(max_seq);
+        if (!trace_path.empty()) engine.set_next_trace_path(trace_path);
         std::vector<int32_t> out;
         if (use_spec) {
             out = engine.generate_speculative(seq, prompt_ids, max_tokens, draft_depth, stats, stream);

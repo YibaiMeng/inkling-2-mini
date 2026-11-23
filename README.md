@@ -9,11 +9,12 @@ Benchmark prompt: *"Write a short Python function to compute Fibonacci numbers i
 | Engine / Mode | Init Time | Decode Throughput | Speedup vs Ollama | Token Exactness vs Plain B=1 |
 | :--- | :---: | :---: | :---: | :---: |
 | Ollama (`mlxrunner`, DSpark spec) | 7.23 s | 30.94 tok/s | 1.00× | Baseline |
-| **inkling** — Plain `B=1` (no spec) | 0.79 s | **32.6–32.8 tok/s** | 1.06× | 256 / 256 |
-| **inkling** — Speculative `B=1` (`--spec`, adaptive) | 1.62 s | **42.2–50.2 tok/s** | **1.61×** | **256 / 256** |
+| **inkling** — Plain `B=1` (no spec) | 0.79 s | **34.37 tok/s** (29.1 ms/tok) | 1.11× | 256 / 256 |
+| **inkling** — Speculative `B=1` (`--spec`, adaptive) | 1.62 s | **49.7–50.8 tok/s** | **1.61×** | **256 / 256** |
 | **inkling** — Long-Context 8K Plain / Spec `B=1` | 1.62 s | **28.2 / 33.8 tok/s** | — | **128 / 128** |
-| **inkling** — Concurrent Batch `B=2` | 0.96 s | **57.9 agg tok/s** (28.9 tok/s/seq) | **1.87×** | **128 / 128** |
-| **inkling** — Concurrent Batch `B=4` | 0.96 s | **89.4 agg tok/s** (22.4 tok/s/seq) | **2.90×** | **128 / 128** |
+| **inkling** — Concurrent Batch `B=2` | 0.96 s | **63.49 agg tok/s** (31.7 tok/s/seq) | **2.05×** | **128 / 128** |
+| **inkling** — Concurrent Batch `B=4` | 0.96 s | **100.84 agg tok/s** (25.2 tok/s/seq) | **3.26×** | **128 / 128** |
+| **inkling** — Concurrent Batch `B=8` | 0.96 s | **132.01 agg tok/s** (16.5 tok/s/seq) | **4.27×** | **128 / 128** |
 
 ### Prefill Throughput & Hardware Roofline (Apple M4 Pro: 6.55 TFLOPS AMX Peak, 254 GB/s DRAM)
 
